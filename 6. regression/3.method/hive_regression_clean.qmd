@@ -1,0 +1,948 @@
+---
+title: "Study 1 (Hive): Engagement, misinformation, and emotional language"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+editor: visual
+---
+
+This script runs the Study 1 analysis in four stages: it builds the variables and defines the sample, looks at the data visually, examines correlations across the model variables, screens the engagement outcomes and profiles the emotions with t-tests, and then estimates three families of regressions for each retained outcome. All language about the results is associative rather than causal, in line with an observational field design. Models use `feols`; standard errors are heteroskedasticity robust (HC1) and are not clustered, because author is absorbed as a fixed effect instead. Engagement is logged with `log1p` because the outcomes are right skewed.
+
+# 0. Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)    # data handling and plots
+library(readxl)       # read the .xlsx dataset
+library(janitor)      # clean column names
+library(fixest)       # regressions with fixed effects
+library(modelsummary) # regression tables
+library(gt)           # table objects + PDF export
+library(ggcorrplot)   # correlation heatmap
+library(marginaleffects) # adjusted means / per-level slopes (Table C companion, TOST inputs)
+# NOTE: car is intentionally not attached; car::recode() would mask dplyr::recode().
+rm(list = ls()); set.seed(20260101)
+
+# ---- paths ------------------------------------------------------------------
+data_path <- "C:\\Users\\batuh\\PycharmProjects\\Thesis\\fact_checked_hive_pipeline\\6. regression\\hive_regression_dataset.xlsx"
+fig_dir   <- "figures"; dir.create(fig_dir, showWarnings = FALSE)
+
+# ---- inference --------------------------------------------------------------
+# HC1 robust, NO clustering. Author is absorbed as a fixed effect in column 3.
+# To switch to classical errors set this to "iid".
+se_main <- "hetero"
+
+# ---- regression PDF output --------------------------------------------------
+# Every regression table is also written as its own PDF into this folder.
+# Set save_pdf to FALSE to skip writing files. PDF export uses gt::gtsave, which
+# needs the 'webshot2' package and a Chrome/Chromium install:
+#   install.packages("webshot2")
+pdf_dir  <- "regression_pdfs"; dir.create(pdf_dir, showWarnings = FALSE)
+save_pdf <- TRUE
+
+# ---- shared look ------------------------------------------------------------
+acc_cols <- c("Accurate" = "#2166AC", "Misinformation" = "#B2182B")
+theme_pres <- function(base = 12)
+  theme_minimal(base_size = base) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.title.position = "plot",
+        panel.grid.minor = element_blank(),
+        legend.position = "top")
+save_fig <- function(name, w = 7, h = 4.5)
+  ggsave(file.path(fig_dir, name), width = w, height = h, dpi = 300, bg = "white")
+```
+
+# 1. Building the variables
+
+Raw columns become model variables: the five engagement outcomes are logged, emotional language and the six discrete emotions are standardised so coefficients read per standard deviation, and two accuracy measures are built, the binary `misinformation` flag and the five level `accuracy_5` scale from `final_label` (the 19 bare `misinformation` labels are folded into `false`, reference level is `true`). `net_rshares` is not built, since it did not populate in this extract. `distinct_voters` and `upvotes` are built so they appear in the t-test screen, but as redundant approval copies of `net_votes` they are excluded from the correlation and are not carried into the regressions.
+
+```{r}
+data <- read_xlsx(data_path) |> clean_names()
+num  <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+
+emo6    <- c("anger", "disgust", "fear", "joy", "sadness", "surprise")
+eng_raw <- c("payout", "net_votes", "comments", "reblogs", "downvotes",
+             "distinct_voters", "upvotes")
+
+# logged engagement outcomes (log_payout, log_net_votes, log_comments, log_reblogs,
+# log_downvotes, log_distinct_voters, log_upvotes)
+data <- data |> mutate(across(all_of(eng_raw), num))
+data <- data |> mutate(across(all_of(eng_raw), ~ log1p(pmax(.x, 0)), .names = "log_{.col}"))
+
+# emotions and emotional language: raw kept for the profile, standardised for the models
+data <- data |>
+  mutate(across(all_of(c(emo6, "neutral", "emotional_language")), num),
+         emo_z = as.numeric(scale(emotional_language)),
+         across(all_of(emo6), ~ as.numeric(scale(.x)), .names = "{.col}_z"))
+
+# accuracy, controls, and fixed-effect keys
+data <- data |>
+  mutate(misinformation    = num(misinformation),     # 1 = misinformation, 0 = accurate
+         log_len           = num(log_len),             # post length (within-author varying)
+         is_political      = num(is_political),        # within-author varying
+         month             = as.factor(month),
+         author            = as.character(author))
+
+# five-level accuracy scale (ref = true)
+lvl5    <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+to_acc5 <- function(fl) {
+  fl <- tolower(trimws(as.character(fl)))
+  dplyr::case_when(fl %in% lvl5 ~ fl, fl == "misinformation" ~ "false", TRUE ~ NA_character_)
+}
+data <- data |>
+  mutate(accuracy_5 = fct_relevel(factor(to_acc5(final_label), levels = lvl5), "true"))
+
+# analysis sample
+model_data <- data |>
+  filter(analysis_sample == TRUE, !is.na(emo_z), !is.na(log_len)) |>
+  mutate(category = fct_infreq(factor(category)))  # most common topic = baseline
+```
+
+# 2. What does the sample look like?
+
+```{r}
+cat("Analysis sample:", nrow(model_data),
+    "| unique authors:", dplyr::n_distinct(model_data$author), "\n\n")
+cat("Accuracy (binary):\n"); print(table(Misinformation = model_data$misinformation))
+cat("\nFive accuracy levels (note the small pants_on_fire cell):\n")
+print(table(model_data$accuracy_5, useNA = "ifany"))
+```
+
+## 2b. Within-author variation (can column 4 speak to H1?)
+
+The author-fixed-effects column (column 4) identifies the misinformation effect only from authors who posted both accurate and misinformation content. This chunk reports how many such authors exist and how many posts they carry, so the within-author null can be read as a genuine finding rather than an artifact of absorbed variation. It also checks the much thinner five-level cells (pants_on_fire in particular), which is why the five-level author column should be read more cautiously than the binary one.
+
+```{r}
+#| label: within-author-check
+# Binary misinformation: who provides the within-author identifying variation?
+auth_var <- model_data |>
+  group_by(author) |>
+  summarise(n_posts    = n(),
+            n_misinfo  = sum(misinformation == 1, na.rm = TRUE),
+            n_accurate = sum(misinformation == 0, na.rm = TRUE),
+            mixed      = n_misinfo > 0 & n_accurate > 0,
+            .groups = "drop")
+
+auth_var |>
+  summarise(authors            = n(),
+            multi_post_authors = sum(n_posts >= 2),
+            mixed_authors      = sum(mixed),
+            posts_in_mixed     = sum(n_posts[mixed])) |>
+  print()
+
+cat("\nShare of the author-FE sample that sits inside a mixing author:\n")
+cat(round(100 * sum(auth_var$n_posts[auth_var$mixed]) /
+            sum(auth_var$n_posts[auth_var$n_posts >= 2]), 1), "%\n", sep = "")
+
+# Five-level accuracy: how thin is the within-author variation per label?
+# An author contributes within-author identification for a label only if they
+# also posted at least one post of a different label.
+cat("\nAuthors with within-author variation involving each accuracy level:\n")
+acc5_within <- model_data |>
+  filter(!is.na(accuracy_5)) |>
+  group_by(author) |>
+  filter(dplyr::n_distinct(accuracy_5) >= 2) |>      # keep authors who vary across levels
+  ungroup() |>
+  count(accuracy_5, name = "posts_in_varying_authors")
+print(acc5_within)
+```
+
+# 3. Exploring the data visually
+
+Descriptive only and unadjusted, so any gap here can reflect topic, length, or author rather than accuracy or emotion. The adjusted models below are the actual evidence.
+
+```{r}
+#| fig-width: 6.5
+#| fig-height: 4
+ggplot(model_data, aes(log_payout)) +
+  geom_histogram(bins = 40, fill = "#4C72B0", color = "white") +
+  labs(title = "Distribution of log payout", x = "log(1 + payout)", y = "Posts") +
+  theme_pres()
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 4
+acc_lab <- function(x) factor(ifelse(x == 1, "Misinformation", "Accurate"),
+                              levels = c("Accurate", "Misinformation"))
+core_out <- c(log_payout = "Payout", log_net_votes = "Net votes",
+              log_comments = "Comments", log_reblogs = "Reblogs", log_downvotes = "Downvotes")
+model_data |>
+  mutate(grp = acc_lab(misinformation)) |>
+  pivot_longer(all_of(names(core_out)), names_to = "outcome", values_to = "eng") |>
+  mutate(outcome = dplyr::recode(outcome, !!!core_out)) |>
+  ggplot(aes(grp, eng, fill = grp)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.6) +
+  facet_wrap(~outcome, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = acc_cols, guide = "none") +
+  labs(title = "Engagement by accuracy group (logged)", x = NULL, y = "log(1 + outcome)") +
+  theme_pres(11)
+```
+
+The boxplot above splits accuracy in two and hides the fact that engagement is roughly flat across most accuracy levels and falls only at pants_on_fire. The next figure shows the five-level pattern directly (still unadjusted).
+
+```{r}
+#| label: viz-accuracy5
+#| fig-width: 9
+#| fig-height: 4
+acc5_order <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+acc5_labs  <- c("Pants on fire", "False", "Mostly false", "Mostly true", "True")
+
+acc5_summ <- model_data |>
+  filter(!is.na(accuracy_5)) |>
+  mutate(acc5 = factor(as.character(accuracy_5), levels = acc5_order, labels = acc5_labs)) |>
+  select(acc5, log_net_votes, log_reblogs) |>
+  pivot_longer(c(log_net_votes, log_reblogs), names_to = "outcome", values_to = "eng") |>
+  filter(is.finite(eng)) |>
+  group_by(outcome, acc5) |>
+  summarise(n = n(), m = mean(eng), se = sd(eng) / sqrt(n()), .groups = "drop") |>
+  mutate(lo = m - 1.96 * se, hi = m + 1.96 * se,
+         outcome = dplyr::recode(outcome,
+                          log_net_votes = "Net votes (approval)",
+                          log_reblogs   = "Reblogs (diffusion)"))
+
+ggplot(acc5_summ, aes(acc5, m)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), color = "#B2182B") +
+  facet_wrap(~outcome, scales = "free_y") +
+  labs(title = "Engagement across the five accuracy levels (unadjusted)",
+       subtitle = "Means with 95% intervals; the pants_on_fire cell is small, so its interval is wide",
+       x = NULL, y = "log(1 + outcome)") +
+  theme_pres(11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+save_fig("accuracy5_means.png", w = 9, h = 4)
+```
+
+The single most useful figure for this study motivates the entire author-fixed-effects story: it shows how much of the variation in engagement is simply a matter of who posted. Payout, comments, and downvotes are included even though they are screened out of the regressions, because the point is that author identity dominates every outcome.
+
+```{r}
+#| label: viz-author-share
+#| fig-width: 7
+#| fig-height: 4
+share_out <- c(log_payout = "Payout", log_net_votes = "Net votes",
+               log_comments = "Comments", log_reblogs = "Reblogs",
+               log_downvotes = "Downvotes")
+
+var_share_author <- function(v) {
+  d <- model_data |> select(author, all_of(v)) |>
+    rename(y = !!sym(v)) |> filter(is.finite(y))
+  grand <- mean(d$y); sst <- sum((d$y - grand)^2)
+  ssb <- d |> group_by(author) |>
+    summarise(n = n(), m = mean(y), .groups = "drop") |>
+    summarise(ssb = sum(n * (m - grand)^2)) |> pull(ssb)
+  ssb / sst
+}
+
+auth_share <- tibble(label = unname(share_out),
+                     share = map_dbl(names(share_out), var_share_author)) |>
+  mutate(label = fct_reorder(label, share))
+
+ggplot(auth_share, aes(share, label)) +
+  geom_col(fill = "#4C72B0", width = 0.65) +
+  geom_text(aes(label = scales::percent(share, accuracy = 1)), hjust = -0.15, size = 3.5) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Share of engagement variance explained by author identity",
+       subtitle = "One-way decomposition by author; the remainder is within-author variation",
+       x = "Between-author share of variance", y = NULL) +
+  theme_pres(11)
+save_fig("author_variance_share.png", w = 7, h = 4)
+```
+
+The last figure visualises the H2 setup: whether the emotional-language slope differs by accuracy group. It is kept to the binary split so the lines are stable; the adjusted interaction in Table A is the actual test.
+
+```{r}
+#| label: viz-emo-slope
+#| fig-width: 7
+#| fig-height: 4.2
+model_data |>
+  mutate(grp = factor(ifelse(misinformation == 1, "Misinformation", "Accurate"),
+                      levels = c("Accurate", "Misinformation"))) |>
+  filter(is.finite(emo_z), is.finite(log_net_votes)) |>
+  ggplot(aes(emo_z, log_net_votes, color = grp, fill = grp)) +
+  geom_point(alpha = 0.07, size = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1) +
+  scale_color_manual(values = acc_cols) +
+  scale_fill_manual(values = acc_cols) +
+  labs(title = "Net votes against emotional language, by accuracy group",
+       subtitle = "Unadjusted slopes only; the adjusted interaction in Table A is the test",
+       x = "Emotional language (standardised)", y = "log(1 + net votes)",
+       color = NULL, fill = NULL) +
+  theme_pres(11)
+save_fig("emo_slope_by_accuracy.png", w = 7, h = 4.2)
+```
+
+## 3b. Descriptive figures to share
+
+These figures describe the data itself rather than the models, so they are the ones to send when someone wants to understand the sample. Each saves a 300 dpi PNG into the `figures` folder. The accuracy ramp runs blue (true) to red (pants on fire) so severity reads off the colour.
+
+```{r}
+#| label: share-setup
+acc5_order <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+acc5_labs  <- c("Pants on fire", "False", "Mostly false", "Mostly true", "True")
+acc5_cols  <- c("Pants on fire" = "#B2182B", "False" = "#D6604D",
+                "Mostly false" = "#F4A582", "Mostly true" = "#92C5DE", "True" = "#2166AC")
+grp_of <- function(x) ifelse(x == 1, "Misinformation", "Accurate")
+```
+
+**1. How the accuracy labels are distributed.** Shows the class balance and how rare the most extreme category is.
+
+```{r}
+#| label: share-accuracy-dist
+#| fig-width: 8
+#| fig-height: 4
+comp <- model_data |>
+  filter(!is.na(accuracy_5)) |>
+  mutate(lab = factor(as.character(accuracy_5), levels = acc5_order, labels = acc5_labs)) |>
+  count(lab) |>
+  mutate(pct = n / sum(n))
+
+ggplot(comp, aes(n, lab, fill = lab)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%d  (%.1f%%)", n, 100 * pct)), hjust = -0.1, size = 3.4) +
+  scale_fill_manual(values = acc5_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Accuracy labels across the sample",
+       subtitle = sprintf("%s labelled posts; the most extreme category (pants on fire) is rare",
+                           format(nrow(model_data), big.mark = ",")),
+       x = "Number of posts", y = NULL) +
+  theme_pres(11)
+save_fig("desc_accuracy_distribution.png", w = 8, h = 4)
+```
+
+The same as a binary split (true side vs false side), which is the flag used in Tables A and B:
+
+```{r}
+#| label: share-accuracy-binary
+#| fig-width: 8
+#| fig-height: 3
+comp2 <- model_data |>
+  filter(!is.na(misinformation)) |>
+  mutate(lab = factor(grp_of(misinformation), levels = c("Misinformation", "Accurate"))) |>
+  count(lab) |>
+  mutate(pct = n / sum(n))
+
+ggplot(comp2, aes(n, lab, fill = lab)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%s  (%.1f%%)", format(n, big.mark = ","), 100 * pct)),
+            hjust = -0.1, size = 3.6) +
+  scale_fill_manual(values = acc_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Accurate vs misinformation",
+       subtitle = sprintf("%s labelled posts; the five levels collapsed to the binary flag",
+                          format(nrow(model_data), big.mark = ",")),
+       x = "Number of posts", y = NULL) +
+  theme_pres(11)
+save_fig("desc_accuracy_binary.png", w = 8, h = 3)
+```
+
+**2. Why the outcomes are logged.** Raw engagement is heavily right-skewed; the log transform makes it usable.
+
+```{r}
+#| label: share-distributions
+#| fig-width: 9
+#| fig-height: 6.5
+raw_long <- model_data |>
+  select(payout, net_votes, reblogs) |>
+  pivot_longer(everything(), names_to = "var", values_to = "val") |>
+  mutate(scale = "Raw count",
+         outcome = dplyr::recode(var, payout = "Payout", net_votes = "Net votes", reblogs = "Reblogs"))
+log_long <- model_data |>
+  select(log_payout, log_net_votes, log_reblogs) |>
+  pivot_longer(everything(), names_to = "var", values_to = "val") |>
+  mutate(scale = "Logged: log(1 + x)",
+         outcome = dplyr::recode(var, log_payout = "Payout", log_net_votes = "Net votes", log_reblogs = "Reblogs"))
+dd <- bind_rows(raw_long, log_long) |>
+  mutate(outcome = factor(outcome, levels = c("Payout", "Net votes", "Reblogs")),
+         scale   = factor(scale,   levels = c("Raw count", "Logged: log(1 + x)")))
+
+ggplot(dd, aes(val)) +
+  geom_histogram(bins = 40, fill = "#4C72B0", color = "white", linewidth = 0.1) +
+  facet_grid(outcome ~ scale, scales = "free") +
+  labs(title = "Why the outcomes are logged",
+       subtitle = "Raw engagement is heavily right-skewed (left); the log transform spreads it out (right)",
+       x = NULL, y = "Number of posts") +
+  theme_pres(11)
+save_fig("desc_distributions_raw_vs_log.png", w = 9, h = 6.5)
+```
+
+**3. Posts over time, by accuracy.** Shows the coverage window around the US election.
+
+```{r}
+#| label: share-time
+#| fig-width: 8
+#| fig-height: 4.5
+mon <- model_data |>
+  mutate(grp = grp_of(misinformation),
+         month = factor(as.character(month), levels = sort(unique(as.character(month))))) |>
+  count(month, grp)
+
+totals <- mon |> group_by(month) |> summarise(tot = sum(n), .groups = "drop")
+
+ggplot(mon, aes(month, n, fill = grp)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 3.2) +
+  geom_text(data = totals, aes(month, tot, label = tot), inherit.aes = FALSE,
+            vjust = -0.4, fontface = "bold", size = 3.2) +
+  scale_fill_manual(values = acc_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Posts per month, by accuracy",
+       subtitle = "Coverage spans September 2024 to January 2025, around the US election",
+       x = NULL, y = "Number of posts") +
+  theme_pres(11)
+save_fig("desc_posts_by_month.png", w = 8, h = 4.5)
+```
+
+A side-by-side version, with accurate and misinformation as two separate bars each month:
+
+```{r}
+#| label: share-time-grouped
+#| fig-width: 8
+#| fig-height: 4.5
+ggplot(mon, aes(month, n, fill = grp)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = n), position = position_dodge(width = 0.8),
+            vjust = -0.4, fontface = "bold", size = 3.2) +
+  scale_fill_manual(values = acc_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Posts per month: accurate vs misinformation",
+       subtitle = "Two bars per month, September 2024 to January 2025",
+       x = NULL, y = "Number of posts") +
+  theme_pres(11)
+save_fig("desc_posts_by_month_grouped.png", w = 8, h = 4.5)
+```
+
+Political versus non-political over time. Because the non-political posts were sampled to mirror the political ones across date, the two bars should track each other closely each month, which is the balanced sampling showing up.
+
+```{r}
+#| label: share-political-time
+#| fig-width: 8
+#| fig-height: 4.5
+pol_cols <- c("Political" = "#D55E00", "Non-political" = "#0072B2")
+
+polm <- model_data |>
+  filter(!is.na(is_political)) |>
+  mutate(grp = ifelse(is_political == 1, "Political", "Non-political"),
+         month = factor(as.character(month), levels = sort(unique(as.character(month))))) |>
+  count(month, grp)
+
+ggplot(polm, aes(month, n, fill = grp)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = n), position = position_dodge(width = 0.8),
+            vjust = -0.4, fontface = "bold", size = 3.2) +
+  scale_fill_manual(values = pol_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Posts per month: political vs non-political",
+       subtitle = "Two bars per month, September 2024 to January 2025",
+       x = NULL, y = "Number of posts") +
+  theme_pres(11)
+save_fig("desc_posts_by_month_political.png", w = 8, h = 4.5)
+```
+
+**4. Emotional profile, accurate vs misinformation.** Mean share of each emotion in the two groups.
+
+```{r}
+#| label: share-emotion-profile
+#| fig-width: 7.5
+#| fig-height: 4.5
+emo7 <- c("anger", "disgust", "fear", "joy", "sadness", "surprise", "neutral")
+emo_prof <- model_data |>
+  mutate(grp = grp_of(misinformation)) |>
+  group_by(grp) |>
+  summarise(across(all_of(emo7), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |>
+  pivot_longer(all_of(emo7), names_to = "emotion", values_to = "share") |>
+  mutate(emotion = tools::toTitleCase(emotion))
+ord <- emo_prof |> group_by(emotion) |> summarise(m = mean(share)) |> arrange(m) |> pull(emotion)
+emo_prof <- emo_prof |> mutate(emotion = factor(emotion, levels = ord))
+
+ggplot(emo_prof, aes(share, emotion)) +
+  geom_line(aes(group = emotion), color = "grey75", linewidth = 1) +
+  geom_point(aes(color = grp), size = 3) +
+  scale_color_manual(values = acc_cols, name = NULL) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Emotional profile of posts",
+       subtitle = "Average share of each emotion; misinformation leans more to anger and disgust, less to joy",
+       x = "Average share of post emotion", y = NULL) +
+  theme_pres(11)
+save_fig("desc_emotion_profile.png", w = 7.5, h = 4.5)
+```
+
+**5. Engagement is concentrated in a few authors.** Cumulative share of net votes across authors, with a Gini coefficient.
+
+```{r}
+#| label: share-concentration
+#| fig-width: 6.5
+#| fig-height: 5
+auth_eng <- model_data |>
+  group_by(author) |>
+  summarise(eng = sum(pmax(net_votes, 0), na.rm = TRUE), .groups = "drop") |>
+  arrange(eng)
+ev <- auth_eng$eng; nA <- length(ev)
+gini <- (2 * sum(seq_len(nA) * ev) / (nA * sum(ev))) - (nA + 1) / nA
+lor  <- tibble(cum_authors = seq_len(nA) / nA, cum_eng = cumsum(ev) / sum(ev))
+
+ggplot(lor, aes(cum_authors, cum_eng)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(color = "#B2182B", linewidth = 1.1) +
+  annotate("text", x = 0.04, y = 0.92, hjust = 0,
+           label = sprintf("Gini = %.2f", gini), fontface = "bold", size = 4.2) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "A few authors receive most of the engagement",
+       subtitle = "Cumulative share of net votes across authors, sorted low to high. Dashed line is perfect equality.",
+       x = "Cumulative share of authors", y = "Cumulative share of net votes") +
+  theme_pres(11)
+save_fig("desc_engagement_concentration.png", w = 6.5, h = 5)
+```
+
+**6. Top categories and their accuracy mix.** The most common topics and how accurate or inaccurate each tends to be.
+
+```{r}
+#| label: share-categories
+#| fig-width: 8
+#| fig-height: 5
+topcat <- model_data |> count(category, sort = TRUE) |> slice_head(n = 12) |> pull(category)
+catd <- model_data |>
+  filter(category %in% topcat) |>
+  mutate(category = factor(as.character(category), levels = rev(as.character(topcat))),
+         grp = grp_of(misinformation)) |>
+  count(category, grp)
+
+ggplot(catd, aes(n, category, fill = grp)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = acc_cols, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Top categories and their accuracy mix",
+       subtitle = "The 12 most common topics; bar length is the number of posts, colour is accuracy",
+       x = "Number of posts", y = NULL) +
+  theme_pres(11)
+save_fig("desc_top_categories.png", w = 8, h = 5)
+```
+
+## 3c. Emotion and accuracy interactions (predicted engagement)
+
+These mirror the interaction figures from the YouTube study. In each panel the x-axis is the emotion score from 0 to 1, the blue line is accurate posts and the red line is misinformation, and the shaded bands are 95 percent confidence intervals. If the two lines fan apart, emotional language plays out differently for misinformation, which is the interaction, and the annotated beta is the misinformation-by-emotion term. Each outcome uses one model (misinformation interacted with all six emotions, plus the usual controls and category and month), fit on the raw emotion scores so the axis and beta read like the YouTube figures. The interaction estimates match Table B; these predictions are illustrative and the formal test stays in Table B.
+
+```{r}
+#| label: share-emotion-interactions-netvotes
+#| fig-width: 10
+#| fig-height: 6
+emo6_raw <- c("anger", "disgust", "fear", "joy", "sadness", "surprise")
+sig_star <- function(p) ifelse(p < .001, "***", ifelse(p < .01, "**",
+                        ifelse(p < .05, "*", ifelse(p < .1, "+", ""))))
+
+fit_emo <- function(dv) {
+  f <- as.formula(paste0(
+    dv, " ~ misinformation * (", paste(emo6_raw, collapse = " + "),
+    ") + log_len + is_political + category + month"))
+  lm(f, data = model_data)
+}
+
+emo_interaction_fig <- function(dv, ylab, fname) {
+  m  <- fit_emo(dv)
+  ct <- summary(m)$coefficients
+  preds <- purrr::map_dfr(emo6_raw, function(e) {
+    grid <- do.call(marginaleffects::datagrid,
+                    c(list(model = m, misinformation = c(0, 1)),
+                      setNames(list(seq(0, 1, length.out = 60)), e)))
+    marginaleffects::predictions(m, newdata = grid) |>
+      tibble::as_tibble() |>
+      transmute(emotion = tools::toTitleCase(e),
+                xval  = .data[[e]],
+                group = ifelse(misinformation == 1, "Misinformation", "Accurate"),
+                estimate, conf.low, conf.high)
+  })
+  ann <- purrr::map_dfr(emo6_raw, function(e) {
+    term <- paste0("misinformation:", e)
+    tibble(emotion = tools::toTitleCase(e),
+           lab = sprintf("\u03b2 = %.3f%s", ct[term, "Estimate"], sig_star(ct[term, "Pr(>|t|)"])))
+  })
+
+  ggplot(preds, aes(xval, estimate, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1.1) +
+    geom_text(data = ann, aes(x = 0.5, y = Inf, label = lab), inherit.aes = FALSE,
+              vjust = 1.5, size = 3.1, fontface = "italic") +
+    facet_wrap(~emotion, nrow = 2, scales = "free_y") +
+    scale_color_manual(values = acc_cols, name = NULL) +
+    scale_fill_manual(values = acc_cols, name = NULL) +
+    scale_x_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+    labs(title = paste0("Predicted ", tolower(ylab), " by emotion and accuracy"),
+         subtitle = "Blue = accurate, red = misinformation. Bands are 95% CIs; beta is the interaction term.",
+         x = "Emotion score (0 to 1)", y = paste0("Predicted ", ylab)) +
+    theme_pres(11)
+  save_fig(fname, w = 10, h = 6)
+}
+
+emo_interaction_fig("log_net_votes", "log(1 + net votes)", "desc_emotion_interaction_netvotes.png")
+```
+
+The same panels for diffusion (reblogs):
+
+```{r}
+#| label: share-emotion-interactions-reblogs
+#| fig-width: 10
+#| fig-height: 6
+emo_interaction_fig("log_reblogs", "log(1 + reblogs)", "desc_emotion_interaction_reblogs.png")
+```
+
+# 4. Correlations across the model variables
+
+One heatmap over the numeric variables: the five logged engagement outcomes, the binary misinformation flag, emotional language, the six discrete emotions plus neutral, and the two post-level controls (`log_len`, `is_political`). The author-standing snapshots `reputation_ui`, `log_hp`, and `post_count` are dropped entirely, and `distinct_voters`, `upvotes`, and `net_rshares` are also excluded. The categorical fixed effects (`category`, `month`, `author`) cannot enter a numeric correlation and are omitted; they are absorbed in the models. Note that the six emotions, neutral, and emotional language are compositional (the seven emotion scores sum to one, and emotional language equals one minus neutral), so some strong correlations among them are mechanical.
+
+```{r}
+#| fig-width: 9
+#| fig-height: 8
+cor_vars <- c("log_payout", "log_net_votes", "log_comments", "log_reblogs", "log_downvotes", "log_distinct_voters", "log_upvotes",
+              "misinformation", "emotional_language",
+              "anger", "disgust", "fear", "joy", "sadness", "surprise", "neutral",
+              "log_len", "is_political")
+M <- model_data |>
+  select(any_of(cor_vars)) |>
+  mutate(across(everything(), as.numeric)) |>
+  cor(use = "pairwise.complete.obs")
+ggcorrplot(M, type = "full", lab = TRUE, lab_size = 1.8, tl.cex = 8,
+           colors = c("#6BAED6", "white", "#FB6A4A"),
+           title = "Correlation: model variables")
+```
+
+# 5. T-tests
+
+Every test groups by `misinformation` (1 vs 0) and reports the two group means, their difference, the Welch t statistic, the p value, and the 95% confidence interval for the difference. `Mean_TRUE` is the misinformation group, `Mean_FALSE` is the accurate group.
+
+```{r}
+tt_table <- function(vars, group = "misinformation", data = model_data) {
+  rows <- lapply(vars, function(v) {
+    a <- data[[v]][data[[group]] == 1]; a <- a[is.finite(a)]   # TRUE  = misinformation
+    b <- data[[v]][data[[group]] == 0]; b <- b[is.finite(b)]   # FALSE = accurate
+    tt <- t.test(a, b)                                         # Welch; CI is for a - b
+    data.frame(Variable = v,
+               Mean_TRUE  = mean(a), Mean_FALSE = mean(b),
+               Diff = mean(a) - mean(b),
+               t_stat = unname(tt$statistic), p_value = tt$p.value,
+               CI_low = tt$conf.int[1], CI_high = tt$conf.int[2])
+  })
+  bind_rows(rows) |>
+    mutate(across(c(Mean_TRUE, Mean_FALSE, Diff, t_stat, CI_low, CI_high), ~ round(.x, 3)),
+           p_value = round(p_value, 3))
+}
+```
+
+## 5a. Screen the engagement outcomes
+
+The seven engagement outcomes are each tested against misinformation. The regressions then proceed with net votes and reblogs; payout, comments, and downvotes are dropped because they do not differ by accuracy, and distinct voters and upvotes are dropped as redundant copies of net votes.
+
+```{r}
+dv_all <- c(log_payout          = "Payout (reward)",
+            log_net_votes       = "Net votes (approval)",
+            log_comments        = "Comments (discussion)",
+            log_reblogs         = "Reblogs (diffusion)",
+            log_downvotes       = "Downvotes (pushback)",
+            log_distinct_voters = "Distinct voters (approval; redundant with net votes)",
+            log_upvotes         = "Upvotes (approval; redundant with net votes)")
+dv_screen <- tt_table(names(dv_all))
+dv_screen
+```
+
+```{r}
+# After the screen, drop the outcomes that do not carry forward:
+#   payout, comments, downvotes -> no significant difference by accuracy
+#   distinct_voters, upvotes    -> redundant approval copies of net_votes
+drop_after_screen <- c("log_payout", "log_comments", "log_downvotes",
+                       "log_distinct_voters", "log_upvotes")
+keep_dvs <- setdiff(names(dv_all), drop_after_screen)
+cat("Regression DVs (", length(keep_dvs), "):\n", sep = "")
+cat(paste0(" - ", keep_dvs, " (", dv_all[keep_dvs], ")"), sep = "\n")
+cat("\n=> ", length(keep_dvs) * 12, " regression models (", length(keep_dvs),
+    " DVs x 3 families x 4 columns)\n", sep = "")
+```
+
+## 5b. Emotion profile
+
+The same test applied to the six discrete emotions, neutral, and emotional language, to see whether misinformation posts carry a different emotional signature. This is descriptive and does not screen anything.
+
+```{r}
+emo_profile <- tt_table(c(emo6, "neutral", "emotional_language"))
+emo_profile
+```
+
+# 6. Regressions
+
+For each of the two retained outcomes there are three families, each built up over four columns: (1) the bare interaction, (2) plus all controls, (3) plus controls and the main fixed effects (`category + month`), and (4) a robustness column that adds `author` fixed effects. The controls are post-level only, `log_len` and `is_political`, both measured from the post itself, so they have no snapshot-timing issue and are not absorbed by the author effects. The author-standing snapshots (`reputation_ui`, `log_hp`) are dropped from the analysis, since they postdate the posts and `reputation_ui` is partly built from the rewards of the posts being studied; author confounding is instead addressed in column 4, where the author effects absorb every stable author trait.
+
+- Table A: `misinformation` x emotional language.
+- Table B: `misinformation` interacted with all six standardised emotions.
+- Table C: the five accuracy levels (misinformation types) x emotional language.
+
+Each table is printed inline and also written to `regression_pdfs/` as its own PDF, named by family and outcome (for example `A_net_votes.pdf`).
+
+```{r}
+#| label: reg-helpers
+# Author-standing snapshots (reputation_ui, log_hp) are dropped from the analysis:
+# they postdate the posts and reputation_ui is partly built from the posts' own rewards.
+# Controls are post-level only; author confounding enters via the author-FE column (4).
+ctrl    <- "log_len + is_political"
+fe_main <- "category + month"           # main fixed effects
+fe_auth <- "category + month + author"  # robustness column: author added
+emoB <- paste(paste0(emo6, "_z"), collapse = " + ")
+gof_drop <- "AIC|BIC|Log.Lik|RMSE|Std.Errors|R2 Adj|R2 Pseudo|^F$"
+
+# Explicit term -> label map. Pinning labels makes every model in a table align the
+# same coefficient to the same row; coef_rename = TRUE was splitting a term (e.g. emo_z)
+# into a separate row for the author-FE column. Terms not listed are dropped.
+cmap <- c(
+  "misinformation"               = "Misinformation",
+  "emo_z"                        = "Emotional language (z)",
+  "misinformation:emo_z"         = "Misinformation x Emo. language",
+  "anger_z"                      = "Anger (z)",
+  "disgust_z"                    = "Disgust (z)",
+  "fear_z"                       = "Fear (z)",
+  "joy_z"                        = "Joy (z)",
+  "sadness_z"                    = "Sadness (z)",
+  "surprise_z"                   = "Surprise (z)",
+  "misinformation:anger_z"       = "Misinformation x Anger",
+  "misinformation:disgust_z"     = "Misinformation x Disgust",
+  "misinformation:fear_z"        = "Misinformation x Fear",
+  "misinformation:joy_z"         = "Misinformation x Joy",
+  "misinformation:sadness_z"     = "Misinformation x Sadness",
+  "misinformation:surprise_z"    = "Misinformation x Surprise",
+  "accuracy_5pants_on_fire"      = "Pants on fire",
+  "accuracy_5false"              = "False",
+  "accuracy_5mostly_false"       = "Mostly false",
+  "accuracy_5true"               = "True",  
+  "accuracy_5mostly_true"        = "Mostly true",
+  "accuracy_5pants_on_fire:emo_z"  = "Pants on fire x Emo. language",
+  "accuracy_5false:emo_z"          = "False x Emo. language",
+  "accuracy_5mostly_false:emo_z"   = "Mostly false x Emo. language",
+  "accuracy_5true:emo_z"          = "True x Emo. language",
+  "accuracy_5mostly_true:emo_z"    = "Mostly true x Emo. language",
+  "log_len"                      = "log(length)",
+  "is_political"                 = "Political"
+)
+
+fit_specs <- function(dv, base, data = model_data) {
+  f <- function(rhs, fe = NULL)
+    feols(as.formula(paste0(dv, " ~ ", rhs, if (!is.null(fe)) paste0(" | ", fe))),
+          data, vcov = se_main, notes = FALSE)
+  list(
+    "(1)"                 = f(base),
+    "(2) + controls"      = f(paste0(base, " + ", ctrl)),
+    "(3) + controls + FE" = f(paste0(base, " + ", ctrl), fe_main),
+    "(4) + author FE"     = f(paste0(base, " + ", ctrl), fe_auth)
+  )
+}
+famA <- function(dv) fit_specs(dv, "misinformation*emo_z")
+famB <- function(dv) fit_specs(dv, paste0("misinformation*(", emoB, ")"))
+famC <- function(dv) fit_specs(dv, "accuracy_5*emo_z", data = model_data |> filter(!is.na(accuracy_5)))
+
+# Build the gt table, save it as its own PDF, and return it for inline display.
+show_family <- function(fam, dv, tag, code) {
+  tab <- modelsummary(fam(dv), stars = TRUE, coef_map = cmap, gof_omit = gof_drop,
+                      output = "gt", title = paste0(tag, " - ", dv_all[[dv]]))
+  if (save_pdf) {
+    f <- file.path(pdf_dir, paste0(code, "_", sub("^log_", "", dv), ".pdf"))
+    tryCatch(gt::gtsave(tab, f),
+             error = function(e)
+               message("Could not write ", f, ": ", conditionMessage(e),
+                       "  (install.packages('webshot2') and ensure Chrome is installed)"))
+  }
+  tab
+}
+```
+
+## Table A. Misinformation x emotional language
+
+```{r}
+#| label: tableA
+for (dv in keep_dvs) print(show_family(famA, dv, "Table A", "A"))
+```
+
+## Table B. Misinformation x discrete emotions
+
+```{r}
+#| label: tableB
+for (dv in keep_dvs) print(show_family(famB, dv, "Table B", "B"))
+```
+
+## Table C. Accuracy levels (misinfo types) x emotional language
+
+```{r}
+#| label: tableC
+for (dv in keep_dvs) print(show_family(famC, dv, "Table C", "C"))
+```
+
+## Table C companion. All five accuracy levels (including True)
+
+Table C reports four accuracy levels as differences from the `true` baseline, so `true` has no row of its own. That is an identification constraint, not a dropped result: five categories carry five numbers of information, which a model with an intercept expresses as one baseline plus four contrasts. This companion reports, for all five levels, two absolute quantities from the column-3 model (controls plus category and month effects): the adjusted mean engagement for each label, and the emotional-language slope inside each label. The `true` row of the slope table is exactly the quantity the baseline was holding, so this is the five-row view of Table C with nothing omitted.
+
+```{r}
+#| label: tableC-companion
+acc5_order <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+acc5_labs  <- c("Pants on fire", "False", "Mostly false", "Mostly true", "True")
+
+acc_companion <- function(dv) {
+  m  <- famC(dv)[["(3) + controls + FE"]]
+  nd <- model_data |> filter(!is.na(accuracy_5))
+  
+  # Per-level emotional-language slope. This is the "True x Emo. language" piece.
+  # Slopes difference out the fixed effects, so standard errors are valid here.
+  slp <- avg_slopes(m, variables = "emo_z", by = "accuracy_5", newdata = nd) |>
+    tibble::as_tibble() |>
+    dplyr::transmute(accuracy_5 = as.character(accuracy_5),
+                     emo_slope = estimate, emo_slope_se = std.error,
+                     emo_slope_p = p.value)
+  
+  # Adjusted mean level per label. With category/month fixed effects, marginaleffects
+  # cannot propagate the fixed-effect uncertainty, so this is point estimates only
+  # (vcov = FALSE). Read these as descriptive adjusted levels, not as tested contrasts.
+  prd <- avg_predictions(m, by = "accuracy_5", newdata = nd, vcov = FALSE) |>
+    tibble::as_tibble() |>
+    dplyr::transmute(accuracy_5 = as.character(accuracy_5),
+                     adj_mean = estimate)
+  
+  dplyr::left_join(prd, slp, by = "accuracy_5") |>
+    dplyr::mutate(accuracy_5 = factor(accuracy_5, levels = acc5_order, labels = acc5_labs)) |>
+    dplyr::arrange(accuracy_5)
+}
+
+for (dv in keep_dvs) {
+  cat("\n", dv_all[[dv]], "  (log scale; slope is per SD of emotional language)\n", sep = "")
+  tab <- acc_companion(dv)
+  print(tab)
+  
+  gt_tab <- tab |>
+    gt::gt() |>
+    gt::fmt_number(columns = where(is.numeric), decimals = 3) |>
+    gt::tab_header(title = paste0("Table C companion - ", dv_all[[dv]]),
+                   subtitle = "Adjusted level (point est.) and emotional-language slope per accuracy label")
+  if (save_pdf) {
+    f <- file.path(pdf_dir, paste0("Ccomp_", sub("^log_", "", dv), ".pdf"))
+    tryCatch(gt::gtsave(gt_tab, f),
+             error = function(e) message("Could not write ", f, ": ", conditionMessage(e)))
+  }
+}
+```
+
+## Equivalence tests (TOST)
+
+A non-significant coefficient does not by itself establish that an effect is absent: the same non-significance can come from a true null or from a study too underpowered to detect a real effect. Because this study argues a careful null, that tokenized engagement does not amplify misinformation, it needs a tool that separates those two cases. The two one-sided tests (TOST) procedure does this by reversing the question. A smallest engagement difference that would matter for the argument is declared in advance, the equivalence bound, and the test asks whether the effect lies inside that bound. If an effect as large as the bound can be rejected on both sides, the effect may be described as statistically equivalent to zero at that threshold, which is a positive claim rather than an absence of one. Because the outcomes are log1p, a coefficient of size b is approximately a `100 * (exp(b) - 1)` percent change in engagement, so the bound below of 0.10 corresponds to roughly an 10.5 percent difference. The bound is a substantive choice set before seeing the result, not tuned until equivalence appears.
+
+```{r}
+#| label: tost
+# TOST for equivalence on a single coefficient. Reports the 90% CI (the interval
+# that must sit inside the bound for equivalence at alpha = 0.05) and the TOST
+# p-value (equivalence concluded if < 0.05). Run on the column-3 binary models.
+tost_coef <- function(m, term, bound, alpha = 0.05) {
+  ct <- as.data.frame(fixest::coeftable(m))
+  if (!term %in% rownames(ct)) return(NULL)
+  est <- ct[term, "Estimate"]; se <- ct[term, "Std. Error"]
+  df  <- tryCatch(fixest::degrees_freedom(m, type = "t"), error = function(e) Inf)
+  p_low  <- pt((est + bound) / se, df, lower.tail = FALSE)  # H0: effect <= -bound
+  p_high <- pt((est - bound) / se, df, lower.tail = TRUE)   # H0: effect >= +bound
+  crit   <- qt(1 - alpha, df)
+  tibble(term = term,
+         estimate = round(est, 4), se = round(se, 4),
+         pct_approx = round(100 * (exp(est) - 1), 2),
+         bound = bound,
+         ci90_low = round(est - crit * se, 4),
+         ci90_high = round(est + crit * se, 4),
+         p_tost = round(max(p_low, p_high), 4),
+         equivalent = (est - crit * se > -bound) & (est + crit * se < bound))
+}
+
+bound_eng <- 0.10   # about +/-10.5%; set from theory, never tuned to the result
+
+tost_results <- bind_rows(lapply(keep_dvs, function(dv) {
+  m <- famA(dv)[["(3) + controls + FE"]]
+  bind_rows(
+    tost_coef(m, "misinformation",       bound_eng),   # H1: no accuracy effect
+    tost_coef(m, "misinformation:emo_z", bound_eng)    # H2: no moderation
+  ) |> mutate(outcome = dv_all[[dv]], .before = 1)
+}))
+tost_results
+```
+
+When `equivalent` is TRUE, the effect is bounded inside the threshold and the result can be written as ruling out an amplification larger than about that percentage. When `equivalent` is FALSE and the ordinary coefficient is also non-significant, the honest reading is that the result is inconclusive at that bound rather than a clean null. If payout is reinstated as a primary outcome, point `tost_coef` at its column-3 model as well, since the reward outcome is the centre of the argument.
+
+# 7. Period analysis (exploratory): pre, election, post
+
+A separate, exploratory look at whether the misinformation-engagement link shifts across the US election timeline. It does not change the models above and is not a substitute for the `month` fixed effects, which stay in place. Months are grouped into pre-election (September and October), election (November), and post-election (December and January). For each retained outcome the binary-misinformation model `misinformation * emo_z` is re-fit on each period subsample, keeping the post-level controls and the category and month fixed effects. The five-level accuracy table and the author fixed effects are deliberately left out here, since the pants_on_fire cell (13 to 25 posts per period) and within-author variation are too thin once the sample is split. Read this as exploratory: three periods invite multiple comparisons, and defining the election window as November is a modeling choice.
+
+```{r}
+#| label: period-setup
+pd_data <- model_data |>
+  mutate(period = dplyr::recode(as.character(month),
+                                "2024-09" = "pre", "2024-10" = "pre",
+                                "2024-11" = "election",
+                                "2024-12" = "post", "2025-01" = "post"),
+         period = factor(period, levels = c("pre", "election", "post")))
+
+period_table <- function(dv) {
+  labs <- c(pre = "Pre (Sep-Oct)", election = "Election (Nov)", post = "Post (Dec-Jan)")
+  mods <- lapply(names(labs), function(p)
+    feols(as.formula(paste0(dv, " ~ misinformation*emo_z + ", ctrl, " | ", fe_main)),
+          data = pd_data |> filter(period == p), vcov = se_main, notes = FALSE))
+  names(mods) <- labs
+  tab <- modelsummary(mods, stars = TRUE, coef_map = cmap, gof_omit = gof_drop,
+                      output = "gt", title = paste0("Period split - ", dv_all[[dv]]))
+  if (save_pdf) {
+    f <- file.path(pdf_dir, paste0("P_", sub("^log_", "", dv), ".pdf"))
+    tryCatch(gt::gtsave(tab, f),
+             error = function(e) message("Could not write ", f, ": ", conditionMessage(e)))
+  }
+  tab
+}
+```
+
+```{r}
+#| label: period-tables
+for (dv in keep_dvs) print(period_table(dv))
+```
+
+```{r}
+library(gt)
+library(tibble)
+
+spec <- tribble(
+  ~Role,             ~Variable,                  ~Measurement,                                                ~Note,
+  "Outcomes (DV)",   "Net votes (approval)",     "log(1 + net votes)",                                        "Logged because the raw counts are right-skewed (long-tailed)",
+  "Outcomes (DV)",   "Reblogs (diffusion)",      "log(1 + reblogs)",                                          "Logged because the raw counts are right-skewed (long-tailed)",
+  "Predictor (IV)",  "Misinformation (binary)",  "1 = false-side, 0 = true-side",                             "Primary accuracy flag",
+  "Predictor (IV)",  "Accuracy (five-level)",    "pants_on_fire / false / mostly false / mostly true / true", "Reference category: true",
+  "Moderator",       "Emotional language",       "z-standardised",                                            "Higher = more emotional language; effects read per standard deviation",
+  "Control",         "Post length",              "log(1 + characters)",                                       "Longer posts tend to draw more engagement",
+  "Control",         "Political",                "1 = political, 0 = otherwise",                              "Absorbed once category fixed effects are included",
+  "Fixed effects",   "Category",                 "Absorbed",                                                  "Topic of the post",
+  "Fixed effects",   "Month",                    "Absorbed",                                                  "Calendar month of posting",
+  "Fixed effects",   "Author",                   "Absorbed (robustness column only)",                         "Added in a separate column to check within-author effects"
+)
+
+tab <- spec |>
+  gt(groupname_col = "Role") |>
+  tab_header(title = "Model specification") |>
+  cols_label(Variable = "Variable", Measurement = "Measurement / coding", Note = "Note") |>
+  tab_source_note(
+    "Note. Standard errors are heteroskedasticity-robust (HC1). Estimated by OLS with fixed effects."
+  ) |>
+  opt_row_striping() |>
+  tab_options(
+    table.font.size = px(13),
+    heading.title.font.size = px(17),
+    heading.title.font.weight = "bold",
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold",
+    data_row.padding = px(5),
+    table.border.top.color = "grey40",
+    column_labels.border.bottom.color = "grey40"
+  )
+
+tab  # preview in the RStudio Viewer
+
+# Save a high-resolution PNG for the email:
+gtsave(tab, "model_specification.png", expand = 12, vwidth = 1100)
+```
