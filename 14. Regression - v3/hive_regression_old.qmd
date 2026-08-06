@@ -1,0 +1,1384 @@
+---
+title: "Study 1 (Hive): Engagement, misinformation, and emotional language"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+editor: visual
+---
+
+This document runs the complete Study 1 analysis in a fixed narrative order. Section 1 builds every variable in one place, confirmatory and exploratory alike, so all later sections draw on identical constructions. Section 2 describes the sample. Section 3 screens the seven candidate engagement outcomes with t-tests. Section 4 shows the correlation structure across outcomes and predictors, after which the final set of dependent variables is fixed. Section 5 verifies that the within-author comparisons are genuinely identified. Section 6 answers the confirmatory questions (H1 and H2). Section 7 asks what actually drives engagement on Hive and decomposes the author effect. Section 8 takes the promised closer look at emotional language dispersion, valence dynamics, and political identity references, and documents the exclusion of the outrage classifier. Section 9 collects robustness checks.
+
+All language about results is associative rather than causal, in line with an observational field design. Models use `feols`; standard errors are heteroskedasticity robust (HC1) and not clustered, because author is absorbed as a fixed effect in the key comparison column. Engagement outcomes are logged with `log1p` because the raw counts are right skewed; for reblogs, where roughly three quarters of posts have none, the primary specification is the extensive margin (any reblog vs none) with the logged count as companion.
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(tidyverse)       # data handling and plots
+library(readxl)          # read the .xlsx dataset
+library(janitor)         # clean column names
+library(fixest)          # regressions with fixed effects
+library(modelsummary)    # regression tables
+library(gt)              # table objects + PDF export
+library(ggcorrplot)      # correlation heatmap
+library(marginaleffects) # predictions and per-level slopes
+library(arrow)           # parquet files (exploratory variables)
+# NOTE: car is intentionally not attached; car::recode() would mask dplyr::recode().
+rm(list = ls()); set.seed(20260101)
+
+# ---- paths ------------------------------------------------------------------
+base_dir  <- "C:\\Users\\batuh\\PycharmProjects\\Thesis\\fact_checked_hive_pipeline"
+data_path <- file.path(base_dir, "6. regression",              "hive_regression_dataset.xlsx")
+dyn_path  <- file.path(base_dir, "9. Sentence Emotion Scoring", "hive_emotion_dynamics_filtered.parquet")
+pol_path  <- file.path(base_dir, "10. Political Identity Language", "hive_political_identity.parquet")
+pf_path   <- file.path(base_dir, "12. Post Features",           "hive_post_features.parquet")
+std_path  <- file.path(base_dir, "12. Post Features",           "hive_author_standing.parquet")
+
+fig_dir <- "figures";        dir.create(fig_dir, showWarnings = FALSE)
+pdf_dir <- "regression_pdfs"; dir.create(pdf_dir, showWarnings = FALSE)
+save_pdf <- TRUE   # PDF export needs webshot2 + Chrome/Chromium
+
+# ---- inference --------------------------------------------------------------
+# HC1 robust, NO clustering. Author is absorbed as a fixed effect in column 4.
+se_main <- "hetero"
+
+# ---- shared look ------------------------------------------------------------
+acc_cols <- c("Accurate" = "#2166AC", "Misinformation" = "#B2182B")
+theme_pres <- function(base = 12)
+  theme_minimal(base_size = base) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.title.position = "plot",
+        panel.grid.minor = element_blank(),
+        legend.position = "top")
+save_fig <- function(name, w = 7, h = 4.5)
+  ggsave(file.path(fig_dir, name), width = w, height = h, dpi = 300, bg = "white")
+```
+
+# 1. Data and variables
+
+Every variable used anywhere in this document is built here, in one pass, so the confirmatory and exploratory sections cannot drift apart. Two measurement facts are stated up front because they matter for reading later tables. First, the confirmatory emotional language variable (`emo_z`) is the post-level score from the chunk-and-average DistilRoBERTa pipeline, while the exploratory mean (`emean_z`) is the average of sentence-level scores after boilerplate filtering; the two correlate at about .72 and are related but not identical quantities, so their coefficients are never compared directly. Second, valence dispersion and valence volatility correlate at .84 in this corpus, so they are treated as alternative operationalisations of one construct (valence movement) and never enter the same model, mirroring the rule already applied to the emotional language family (dispersion retained, volatility as variant, r = .82).
+
+## 1.1 Core variables
+
+```{r}
+#| label: build-core
+data <- read_xlsx(data_path) |> clean_names()
+num  <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+
+emo6    <- c("anger", "disgust", "fear", "joy", "sadness", "surprise")
+eng_raw <- c("payout", "net_votes", "comments", "reblogs", "downvotes",
+             "distinct_voters", "upvotes")
+
+# Logged engagement outcomes + the extensive margin for reblogs
+data <- data |>
+  mutate(across(all_of(eng_raw), num)) |>
+  mutate(across(all_of(eng_raw), ~ log1p(pmax(.x, 0)), .names = "log_{.col}"),
+         any_reblog = as.integer(reblogs > 0))
+
+# Emotions and emotional language: raw values here; standardisation happens
+# after the analysis sample is fixed, so coefficients read per SD of the
+# sample actually analysed.
+data <- data |>
+  mutate(across(all_of(c(emo6, "neutral", "emotional_language")), num))
+
+# Accuracy, controls, fixed-effect keys, author-standing snapshots
+data <- data |>
+  mutate(misinformation        = num(misinformation),        # 1 = misinformation
+         misinformation_strict = num(misinformation_strict),
+         log_len       = num(log_len),
+         is_political  = num(is_political),
+         month         = as.factor(month),
+         author        = as.character(author),
+         label_source  = as.character(label_source))
+# NOTE: the scrape-time snapshots reputation_ui, effective_vesting, and
+# post_count are NOT used anywhere. They describe accounts as of January
+# 2025, not as of the observation window, and reputation is partly built
+# from the rewards of the posts under study. Author standing enters via
+# strictly pre-window measures reconstructed from HiveSQL operation
+# tables (joined in section 1.2b).
+
+# Five-level accuracy scale (ref = true); bare 'misinformation' labels fold into 'false'
+lvl5    <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+to_acc5 <- function(fl) {
+  fl <- tolower(trimws(as.character(fl)))
+  dplyr::case_when(fl %in% lvl5 ~ fl, fl == "misinformation" ~ "false",
+                   TRUE ~ NA_character_)
+}
+data <- data |>
+  mutate(accuracy_5 = fct_relevel(factor(to_acc5(final_label), levels = lvl5), "true"))
+
+# ---- analysis sample, then standardisation ----------------------------------
+model_data <- data |>
+  filter(analysis_sample == TRUE, !is.na(emotional_language), !is.na(log_len)) |>
+  mutate(category = fct_infreq(factor(category)),
+         emo_z    = as.numeric(scale(emotional_language)),
+         across(all_of(emo6), ~ as.numeric(scale(.x)), .names = "{.col}_z"))
+
+cat("Analysis sample:", nrow(model_data),
+    "| unique authors:", n_distinct(model_data$author), "\n")
+cat("Misinformation flag:\n"); print(table(model_data$misinformation))
+cat("Five levels (note the small pants_on_fire cell):\n")
+print(table(model_data$accuracy_5, useNA = "ifany"))
+cat("\nShare of posts with zero reblogs:",
+    round(100 * mean(model_data$reblogs == 0, na.rm = TRUE), 1), "%\n")
+```
+
+## 1.2 Exploratory variables (sentence dynamics, political references, format)
+
+These come from three sources built outside this document: sentence-level emotional dynamics scored with the same DistilRoBERTa classifier plus VADER for valence, after boilerplate filtering; political identity-reference counts adapted from the dictionaries of Rathje et al. (2021), counted overall because the in-group vs out-group contrast requires author political identity, which is unknown for Hive authors; and post format features from the January 2025 scrape. A fourth extension, the moral outrage classifier of Brady et al. (2021), was made operational but excluded after a manual validity audit (documented in section 8.6); no outrage variable enters any model.
+
+```{r}
+#| label: build-exploratory
+#| message: false
+dyn <- read_parquet(dyn_path) |>
+  mutate(.key = as.character(doc_id)) |>
+  select(.key, n_sentences_kept, n_sentences_dropped,
+         emo_lang_mean, emo_lang_sd, emo_lang_volatility,
+         vader_compound_mean, vader_compound_sd, vader_compound_volatility)
+pol <- read_parquet(pol_path) |>
+  mutate(.key = as.character(doc_id)) |>
+  select(.key, pol_total, pol_log1p, pol_density100, pol_any)
+pf  <- read_parquet(pf_path) |>
+  mutate(.key = as.character(doc_id)) |>
+  select(.key, n_images, n_links, n_tags, is_weekend, post_hour)
+
+model_data <- model_data |>
+  mutate(.key = as.character(doc_id)) |>
+  left_join(dyn, by = ".key") |>
+  left_join(pol, by = ".key") |>
+  left_join(pf,  by = ".key")
+
+cat("Joined:", sum(!is.na(model_data$pol_total)), "political,",
+    sum(!is.na(model_data$emo_lang_mean)), "dynamics,",
+    sum(!is.na(model_data$n_images)), "format rows of", nrow(model_data), "\n")
+
+# Standardised once on the analysis sample so every coefficient reads per SD
+# of the same sample. Skewed counts enter as log1p before scaling.
+model_data <- model_data |>
+  mutate(emean_z    = as.numeric(scale(emo_lang_mean)),
+         esd_z      = as.numeric(scale(emo_lang_sd)),
+         evol_z     = as.numeric(scale(emo_lang_volatility)),
+         vmean_z    = as.numeric(scale(vader_compound_mean)),
+         vsd_z      = as.numeric(scale(vader_compound_sd)),
+         vvol_z     = as.numeric(scale(vader_compound_volatility)),
+         pol_z      = as.numeric(scale(pol_log1p)),
+         pol_dens_z = as.numeric(scale(pol_density100)),
+         img_z      = as.numeric(scale(log1p(n_images))),
+         lnk_z      = as.numeric(scale(log1p(n_links))),
+         tags_z     = as.numeric(scale(log1p(n_tags))),
+         hour_f     = as.factor(post_hour))
+
+# Dynamics sample: dispersion/volatility need at least three usable sentences.
+exp_dyn <- model_data |> filter(!is.na(vader_compound_volatility),
+                                !is.na(emo_lang_volatility))
+cat("Dynamics sample:", nrow(exp_dyn),
+    "(", nrow(model_data) - nrow(exp_dyn), "excluded, too few sentences )\n")
+
+# Dictionary validity, one line: political posts should mention identity
+# terms far more often than non-political posts.
+cat("Any political identity mention | political:",
+    round(mean(model_data$pol_any[model_data$is_political == 1], na.rm = TRUE), 3),
+    "| non-political:",
+    round(mean(model_data$pol_any[model_data$is_political == 0], na.rm = TRUE), 3), "\n")
+```
+
+## 1.2b Author standing, strictly pre-window (HiveSQL reconstruction)
+
+Author standing is measured from HiveSQL operation tables, which are append-only histories, using only operations dated before 2024-09-01. Each measure is therefore exact as of the window start and cannot mechanically contain the rewards of any post in the sample. Four measures enter: cumulative author rewards (the standing proxy replacing reputation, which has no historical snapshots and cannot be credibly reconstructed), cumulative curation rewards (a stake-activity proxy, since curation earnings scale with the Hive Power an account actually votes with), lifetime root-post count, and account age at window start. Authors created after the window start carry meaningful zeros.
+
+```{r}
+#| label: build-standing
+#| message: false
+standing <- read_parquet(std_path) |>
+  transmute(author = as.character(author),
+            log_pre_rewards  = log1p(pmax(as.numeric(pre_author_rew_vests), 0)),
+            log_pre_curation = log1p(pmax(as.numeric(pre_curation_vests), 0)),
+            log_pre_posts    = log1p(pmax(as.numeric(pre_root_posts), 0)),
+            log_acct_age     = log1p(pmax(as.numeric(acct_age_days), 0)))
+
+model_data <- model_data |> left_join(standing, by = "author")
+
+std_vars <- c("log_pre_rewards", "log_pre_curation", "log_pre_posts", "log_acct_age")
+cat("Standing coverage:",
+    sum(complete.cases(model_data[std_vars])), "of", nrow(model_data),
+    "posts have all four measures\n")
+cat("Authors with zero pre-window author rewards:",
+    round(100 * mean(model_data$log_pre_rewards == 0, na.rm = TRUE), 1),
+    "% of posts\n")
+```
+
+## 1.3 Model specification at a glance
+
+```{r}
+#| label: spec-table
+spec <- tribble(
+  ~Role,            ~Variable,                 ~Measurement,                                                ~Note,
+  "Outcomes (DV)",  "Net votes",               "log(1 + max(net votes, 0))",                                "Right-skewed counts; 150 negative values floored at zero, see section 9.7",
+  "Outcomes (DV)",  "Any reblog",              "1 = at least one reblog, 0 = none",                         "Diffusion outcome; ~3 in 4 posts have zero reblogs",
+  "Outcomes (DV)",  "Reblogs (log count)",     "log(1 + reblogs)",                                          "Robustness companion only (r = .88 with any reblog)",
+  "Predictor (IV)", "Misinformation (binary)", "1 = false-side, 0 = true-side",                             "Primary accuracy flag",
+  "Predictor (IV)", "Accuracy (five-level)",   "pants_on_fire / false / mostly false / mostly true / true", "Reference category: true",
+  "Moderator",      "Emotional language",      "z-standardised (analysis sample)",                          "Post-level score; effects read per standard deviation",
+  "Control",        "Post length",             "log(1 + characters)",                                       "Longer posts tend to draw more engagement",
+  "Control",        "Political",               "1 = political, 0 = otherwise",                              "Absorbed once category fixed effects are included",
+  "Fixed effects",  "Category",                "Absorbed",                                                  "Topic of the post",
+  "Fixed effects",  "Month",                   "Absorbed",                                                  "Calendar month of posting",
+  "Fixed effects",  "Author",                  "Absorbed (column 4 only)",                                  "The key comparison: within-author estimates"
+)
+tab_spec <- spec |>
+  gt(groupname_col = "Role") |>
+  tab_header(title = "Model specification") |>
+  cols_label(Variable = "Variable", Measurement = "Measurement / coding", Note = "Note") |>
+  tab_source_note("Note. OLS with fixed effects; heteroskedasticity-robust (HC1) standard errors. Final outcome set fixed after the screen in sections 3 and 4.") |>
+  opt_row_striping() |>
+  tab_options(table.font.size = px(13), heading.title.font.size = px(17),
+              heading.title.font.weight = "bold", column_labels.font.weight = "bold",
+              row_group.font.weight = "bold", data_row.padding = px(5))
+if (save_pdf) tryCatch(gtsave(tab_spec, file.path(pdf_dir, "model_specification.png"),
+                              expand = 12, vwidth = 1100),
+                       error = function(e) message(conditionMessage(e)))
+tab_spec
+```
+
+# 2. What the sample looks like
+
+Descriptive only and unadjusted; any gap here can reflect topic, length, or author rather than accuracy or emotion. The adjusted models are the evidence.
+
+```{r}
+#| label: desc-shared
+acc5_order <- c("pants_on_fire", "false", "mostly_false", "mostly_true", "true")
+acc5_labs  <- c("Pants on fire", "False", "Mostly false", "Mostly true", "True")
+acc5_cols  <- c("Pants on fire" = "#B2182B", "False" = "#D6604D",
+                "Mostly false" = "#F4A582", "Mostly true" = "#92C5DE", "True" = "#2166AC")
+grp_of <- function(x) ifelse(x == 1, "Misinformation", "Accurate")
+```
+
+**Accuracy labels.** The class balance, and how rare the most extreme category is.
+
+```{r}
+#| label: desc-accuracy
+#| fig-width: 8
+#| fig-height: 4
+comp <- model_data |>
+  filter(!is.na(accuracy_5)) |>
+  mutate(lab = factor(as.character(accuracy_5), levels = acc5_order, labels = acc5_labs)) |>
+  count(lab) |> mutate(pct = n / sum(n))
+ggplot(comp, aes(n, lab, fill = lab)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%d  (%.1f%%)", n, 100 * pct)), hjust = -0.1, size = 3.4) +
+  scale_fill_manual(values = acc5_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Accuracy labels across the sample",
+       subtitle = sprintf("%s labelled posts; pants on fire is rare",
+                          format(nrow(model_data), big.mark = ",")),
+       x = "Number of posts", y = NULL) +
+  theme_pres(11)
+save_fig("desc_accuracy_distribution.png", w = 8, h = 4)
+```
+
+**Coverage over time.** The window spans September 2024 to January 2025, around the US election.
+
+```{r}
+#| label: desc-time
+#| fig-width: 8
+#| fig-height: 4.5
+mon <- model_data |>
+  mutate(grp = grp_of(misinformation),
+         month = factor(as.character(month), levels = sort(unique(as.character(month))))) |>
+  count(month, grp)
+ggplot(mon, aes(month, n, fill = grp)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = n), position = position_dodge(width = 0.8),
+            vjust = -0.4, fontface = "bold", size = 3.2) +
+  scale_fill_manual(values = acc_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Posts per month: accurate vs misinformation",
+       x = NULL, y = "Number of posts") +
+  theme_pres(11)
+save_fig("desc_posts_by_month_grouped.png", w = 8, h = 4.5)
+```
+
+**Emotional profile.** Misinformation leans more to anger and disgust, less to joy; this motivates the discrete-emotion decomposition in section 6.2.
+
+```{r}
+#| label: desc-emotion-profile
+#| fig-width: 7.5
+#| fig-height: 4.5
+emo7 <- c(emo6, "neutral")
+emo_prof <- model_data |>
+  mutate(grp = grp_of(misinformation)) |>
+  group_by(grp) |>
+  summarise(across(all_of(emo7), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |>
+  pivot_longer(all_of(emo7), names_to = "emotion", values_to = "share") |>
+  mutate(emotion = tools::toTitleCase(emotion))
+ord <- emo_prof |> group_by(emotion) |> summarise(m = mean(share)) |> arrange(m) |> pull(emotion)
+emo_prof <- emo_prof |> mutate(emotion = factor(emotion, levels = ord))
+ggplot(emo_prof, aes(share, emotion)) +
+  geom_line(aes(group = emotion), color = "grey75", linewidth = 1) +
+  geom_point(aes(color = grp), size = 3) +
+  scale_color_manual(values = acc_cols, name = NULL) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Emotional profile of posts",
+       subtitle = "Average share of each emotion by accuracy group",
+       x = "Average share of post emotion", y = NULL) +
+  theme_pres(11)
+save_fig("desc_emotion_profile.png", w = 7.5, h = 4.5)
+```
+
+**Engagement across the five levels (unadjusted).** Engagement is roughly flat across most accuracy levels and falls only at pants_on_fire, whose interval is wide because the cell is small.
+
+```{r}
+#| label: desc-accuracy5-means
+#| fig-width: 9
+#| fig-height: 4
+acc5_summ <- model_data |>
+  filter(!is.na(accuracy_5)) |>
+  mutate(acc5 = factor(as.character(accuracy_5), levels = acc5_order, labels = acc5_labs)) |>
+  select(acc5, log_net_votes, log_reblogs) |>
+  pivot_longer(c(log_net_votes, log_reblogs), names_to = "outcome", values_to = "eng") |>
+  filter(is.finite(eng)) |>
+  group_by(outcome, acc5) |>
+  summarise(n = n(), m = mean(eng), se = sd(eng) / sqrt(n()), .groups = "drop") |>
+  mutate(lo = m - 1.96 * se, hi = m + 1.96 * se,
+         outcome = dplyr::recode(outcome,
+                          log_net_votes = "Net votes",
+                          log_reblogs   = "Reblogs (log count)"))
+ggplot(acc5_summ, aes(acc5, m)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), color = "#B2182B") +
+  facet_wrap(~outcome, scales = "free_y") +
+  labs(title = "Engagement across the five accuracy levels (unadjusted)",
+       subtitle = "Means with 95% intervals",
+       x = NULL, y = "log(1 + outcome)") +
+  theme_pres(11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+save_fig("accuracy5_means.png", w = 9, h = 4)
+```
+
+# 3. Screening the candidate outcomes (t-tests)
+
+Eight engagement outcomes are candidates. Each is tested for a mean difference between misinformation and accurate posts, on the logged scale (for the binary any-reblog outcome the t-test is a two-sample comparison of proportions). The same test is then applied to the emotion variables as a descriptive profile. The screen is transparent input to the outcome decision, not the decision itself: dropping outcomes solely because a t-test is non-significant would be a form of outcome selection, so the final choice in section 4 combines this screen with theory and redundancy.
+
+```{r}
+#| label: tt-helper
+tt_table <- function(vars) {
+  rows <- lapply(vars, function(v) {
+    a <- model_data |> filter(misinformation == 1) |> pull(!!sym(v))
+    b <- model_data |> filter(misinformation == 0) |> pull(!!sym(v))
+    a <- a[is.finite(a)]; b <- b[is.finite(b)]
+    tt <- t.test(a, b)
+    data.frame(Variable = v,
+               Mean_misinfo = mean(a), Mean_accurate = mean(b),
+               Diff = mean(a) - mean(b),
+               t_stat = unname(tt$statistic), p_value = tt$p.value,
+               CI_low = tt$conf.int[1], CI_high = tt$conf.int[2])
+  })
+  bind_rows(rows) |>
+    mutate(across(c(Mean_misinfo, Mean_accurate, Diff, t_stat, CI_low, CI_high),
+                  ~ round(.x, 3)),
+           p_value = round(p_value, 3))
+}
+```
+
+## 3.1 Engagement outcomes
+
+```{r}
+#| label: tt-outcomes
+dv_candidates <- c(log_payout          = "Payout",
+                   log_net_votes       = "Net votes",
+                   log_comments        = "Comments",
+                   log_reblogs         = "Reblogs (log count)",
+                   any_reblog          = "Any reblog",
+                   log_downvotes       = "Downvotes",
+                   log_distinct_voters = "Distinct voters",
+                   log_upvotes         = "Upvotes")
+dv_screen <- tt_table(names(dv_candidates)) |>
+  mutate(Label = dv_candidates[Variable], .after = Variable)
+dv_screen
+```
+
+## 3.2 Emotion profile (descriptive, screens nothing)
+
+```{r}
+#| label: tt-emotions
+emo_profile <- tt_table(c(emo6, "neutral", "emotional_language"))
+emo_profile
+```
+
+# 4. Correlation structure and the final outcome set
+
+One heatmap over all candidate outcomes, confirmatory variables, and exploratory variables, on natural scales. Two kinds of strong correlation are expected and mechanical: the sentence-based mean and dispersion derive from the same scores, and each volatility correlates highly with its own dispersion (r = .82 for emotional language, .84 for valence), which is why the dispersion and volatility of a family never enter the same model. Among the outcomes, upvotes and distinct voters correlate near 1 with net votes because downvotes are rare, and payout is computed from the rshares that votes allocate, so it moves with net votes by construction.
+
+```{r}
+#| label: table-D-corr
+#| fig-width: 11
+#| fig-height: 10
+cor_vars <- model_data |>
+  transmute(log_payout, log_net_votes, log_upvotes, log_distinct_voters,
+            log_comments, log_reblogs, any_reblog, log_downvotes,
+            misinformation, emotional_language,
+            emo_mean = emo_lang_mean, emo_disp = emo_lang_sd,
+            emo_vol = emo_lang_volatility,
+            val_mean = vader_compound_mean, val_disp = vader_compound_sd,
+            val_vol = vader_compound_volatility,
+            pol_refs = pol_log1p,
+            images = log1p(n_images), links = log1p(n_links),
+            tags = log1p(n_tags), weekend = is_weekend,
+            log_len, is_political) |>
+  mutate(across(everything(), as.numeric))
+M <- cor(cor_vars, use = "pairwise.complete.obs")
+p_corr <- ggcorrplot(M, type = "full", lab = TRUE, lab_size = 1.6, tl.cex = 8,
+                     colors = c("#6BAED6", "white", "#FB6A4A"),
+                     title = "Correlations: candidate outcomes, confirmatory and exploratory variables")
+p_corr
+ggsave(file.path(pdf_dir, "D_correlations.png"), p_corr, width = 11, height = 10, dpi = 300)
+```
+
+**Misinformation and the discrete emotions.** Point-biserial correlations of the binary flag with each emotion dimension. These are expectedly small even where the regressions find real differences, because a single correlation compresses the relationship without conditioning on topic or time; the emotion profile in section 2 and Table B in section 6 are the informative views.
+
+```{r}
+#| label: misinfo-emotion-cor
+tibble(variable = c(emo6, "neutral", "emotional_language"),
+       r_with_misinformation = map_dbl(
+         c(emo6, "neutral", "emotional_language"),
+         ~ cor(model_data$misinformation, model_data[[.x]],
+               use = "pairwise.complete.obs"))) |>
+  mutate(r_with_misinformation = round(r_with_misinformation, 3)) |>
+  arrange(desc(abs(r_with_misinformation)))
+```
+
+## 4.1 The final dependent variables
+
+```{r}
+#| label: final-dvs
+r_nv <- function(v) round(cor(model_data$log_net_votes, model_data[[v]],
+                              use = "pairwise.complete.obs"), 3)
+cat("Redundancy with net votes: upvotes r =", r_nv("log_upvotes"),
+    "| distinct voters r =", r_nv("log_distinct_voters"),
+    "| payout r =", r_nv("log_payout"), "\n")
+cat("Redundancy within diffusion: any_reblog vs log_reblogs r =",
+    round(cor(model_data$any_reblog, model_data$log_reblogs,
+              use = "pairwise.complete.obs"), 3), "\n\n")
+
+dv_all <- c(log_net_votes = "Net votes",
+            any_reblog    = "Any reblog")
+keep_dvs <- names(dv_all)
+
+cat("Retained outcomes:\n")
+cat(paste0(" - ", keep_dvs, " (", dv_all[keep_dvs], ")"), sep = "\n")
+cat("\nExcluded or demoted, with reason:\n",
+    " - log_upvotes, log_distinct_voters: redundant approval copies of net votes (r near 1)\n",
+    " - log_payout: mechanically downstream of votes (computed from allocated rshares)\n",
+    " - log_reblogs: r = .88 with any_reblog; with ~73% zeros the log count mostly\n",
+    "   re-expresses the zero vs nonzero boundary; kept as a robustness companion (9.5)\n",
+    " - log_comments, log_downvotes: secondary margins; no accuracy difference in the screen\n")
+```
+
+The retained pair maps onto the two margins the research question names. Net votes is the tokenized action: on Hive an upvote allocates real rewards from the stake-weighted pool, so approval is precisely where a reward-driven amplification of misinformation would have to appear. Any reblog is diffusion, the margin central to the misinformation literature. Because roughly three quarters of posts have zero reblogs and the observed counts span only about twenty distinct values, the binary extensive margin carries essentially all the diffusion information, which the .88 correlation with the log count confirms; the log-count model is therefore reported once, as a robustness companion in section 9.5, rather than duplicated through every main table.
+
+# 5. Identification: can the within-author column speak?
+
+The key comparison in every table below is column 4, which adds author fixed effects and identifies coefficients only from variation within authors. This section verifies that this variation exists, so that the within-author estimates can be read as genuine findings rather than artifacts of absorbed variation.
+
+```{r}
+#| label: within-author-check
+# Who provides the within-author identifying variation for the binary flag?
+auth_var <- model_data |>
+  group_by(author) |>
+  summarise(n_posts    = n(),
+            n_misinfo  = sum(misinformation == 1, na.rm = TRUE),
+            n_accurate = sum(misinformation == 0, na.rm = TRUE),
+            mixed      = n_misinfo > 0 & n_accurate > 0, .groups = "drop")
+auth_var |>
+  summarise(authors            = n(),
+            multi_post_authors = sum(n_posts >= 2),
+            mixed_authors      = sum(mixed),
+            posts_in_mixed     = sum(n_posts[mixed])) |>
+  print()
+
+# Residual variation after author demeaning (multi-post authors only):
+demean_stats <- model_data |>
+  group_by(author) |> filter(n() >= 2) |>
+  mutate(inter = misinformation * emo_z,
+         across(c(misinformation, emo_z, inter), ~ .x - mean(.x), .names = "w_{.col}")) |>
+  ungroup() |>
+  summarise(across(starts_with("w_"), sd))
+cat("\nWithin-author SDs (misinformation, emotional language, interaction):\n")
+print(demean_stats)
+
+# Mixed authors: real emotional-language spread across their two label groups?
+mixed_check <- model_data |>
+  group_by(author) |>
+  filter(n_distinct(misinformation) == 2) |>
+  summarise(sd_emo  = sd(emo_z),
+            emo_gap = abs(mean(emo_z[misinformation == 1]) -
+                          mean(emo_z[misinformation == 0])), .groups = "drop")
+cat("\nMixed authors:", nrow(mixed_check),
+    "| with real emotional-language spread (sd > 0.25):",
+    sum(mixed_check$sd_emo > 0.25, na.rm = TRUE), "\n")
+cat("Emotional-language gap between an author's accurate and misinformation posts:\n")
+print(summary(mixed_check$emo_gap))
+
+# Five-level accuracy: how thin is the within-author variation per label?
+cat("\nPosts per level inside authors who vary across levels (5-level caution):\n")
+model_data |>
+  filter(!is.na(accuracy_5)) |>
+  group_by(author) |> filter(n_distinct(accuracy_5) >= 2) |> ungroup() |>
+  count(accuracy_5, name = "posts_in_varying_authors") |>
+  print()
+```
+
+Reading: the within-author variation is broad, not residual. For a binary flag with roughly one-third prevalence the raw SD is about .47, and .39 of it survives author demeaning; about .72 SD of emotional language and .48 of the interaction remain within authors. Most mixed authors show real spread in emotional language across their accurate and misinformation posts, so the within-author estimates of all three confirmatory terms rest on well-distributed variation. The five-level within-author cells are much thinner, which is why the five-level author column in section 6.3 is read more cautiously than the binary one.
+
+# 6. Confirmatory analysis: H1 and H2
+
+## 6.0 Shared regression machinery
+
+Each family is built up over four columns: (1) the bare terms, (2) plus post-level controls (`log_len`, `is_political`), (3) plus category and month fixed effects, the core adjusted model, and (4) author fixed effects, the within-author comparison. The pre-window author-standing measures from section 1.2b are deliberately not controls in the confirmatory ladder: the confirmatory question is whether accuracy and emotional language are associated with engagement, and standing is a channel through which author identity operates rather than a post-level confounder to hold fixed. Standing enters in section 7, where the question changes to what the author effect is made of.
+
+```{r}
+#| label: reg-helpers
+ctrl    <- "log_len + is_political"
+fe_main <- "category + month"
+fe_auth <- "category + month + author"
+emoB    <- paste(paste0(emo6, "_z"), collapse = " + ")
+gof_drop <- "AIC|BIC|Log.Lik|RMSE|Std.Errors|R2 Adj|R2 Pseudo|^F$"
+
+cmap <- c(
+  "misinformation"                = "Misinformation",
+  "emo_z"                         = "Emotional language (z)",
+  "misinformation:emo_z"          = "Misinformation x Emo. language",
+  "anger_z"                       = "Anger (z)",
+  "disgust_z"                     = "Disgust (z)",
+  "fear_z"                        = "Fear (z)",
+  "joy_z"                         = "Joy (z)",
+  "sadness_z"                     = "Sadness (z)",
+  "surprise_z"                    = "Surprise (z)",
+  "misinformation:anger_z"        = "Misinformation x Anger",
+  "misinformation:disgust_z"      = "Misinformation x Disgust",
+  "misinformation:fear_z"         = "Misinformation x Fear",
+  "misinformation:joy_z"          = "Misinformation x Joy",
+  "misinformation:sadness_z"      = "Misinformation x Sadness",
+  "misinformation:surprise_z"     = "Misinformation x Surprise",
+  "accuracy_5pants_on_fire"       = "Pants on fire",
+  "accuracy_5false"               = "False",
+  "accuracy_5mostly_false"        = "Mostly false",
+  "accuracy_5mostly_true"         = "Mostly true",
+  "accuracy_5pants_on_fire:emo_z" = "Pants on fire x Emo. language",
+  "accuracy_5false:emo_z"         = "False x Emo. language",
+  "accuracy_5mostly_false:emo_z"  = "Mostly false x Emo. language",
+  "accuracy_5mostly_true:emo_z"   = "Mostly true x Emo. language",
+  "log_len"                       = "log(length)",
+  "is_political"                  = "Political"
+)
+
+fit_specs <- function(dv, base, data = model_data) {
+  f <- function(rhs, fe = NULL)
+    feols(as.formula(paste0(dv, " ~ ", rhs, if (!is.null(fe)) paste0(" | ", fe))),
+          data, vcov = se_main, notes = FALSE)
+  list("(1)"                 = f(base),
+       "(2) + controls"      = f(paste0(base, " + ", ctrl)),
+       "(3) + controls + FE" = f(paste0(base, " + ", ctrl), fe_main),
+       "(4) + author FE"     = f(paste0(base, " + ", ctrl), fe_auth))
+}
+famA <- function(dv) fit_specs(dv, "misinformation*emo_z")
+famB <- function(dv) fit_specs(dv, paste0("misinformation*(", emoB, ")"))
+famC <- function(dv) fit_specs(dv, "accuracy_5*emo_z",
+                               data = model_data |> filter(!is.na(accuracy_5)))
+
+show_family <- function(fam, dv, tag, code, map = cmap) {
+  tab <- modelsummary(fam(dv), stars = TRUE, coef_map = map, gof_omit = gof_drop,
+                      output = "gt", title = paste0(tag, " - ", dv_all[[dv]]))
+  if (save_pdf) {
+    f <- file.path(pdf_dir, paste0(code, "_", sub("^log_", "", dv), ".pdf"))
+    tryCatch(gt::gtsave(tab, f),
+             error = function(e) message("Could not write ", f, ": ",
+                                         conditionMessage(e)))
+  }
+  tab
+}
+```
+
+## 6.1 Table A. Misinformation x emotional language
+
+The reading: the raw misinformation penalty in column 1 shrinks under controls and vanishes under category and month fixed effects, so the apparent penalty reflects what misinformation posts tend to be about, not their accuracy. The emotional language coefficient strengthens from column 1 to 2 because the bare estimate mixes a positive emotional-language association with a penalty on political content; unbundling them reveals the positive association for accurate posts. The negative interaction means emotional language shows no comparable gain for misinformation. In column 4, everything is indistinguishable from zero: within authors, neither accuracy nor emotional language moves engagement.
+
+```{r}
+#| label: tableA
+for (dv in keep_dvs) print(show_family(famA, dv, "Table A", "A"))
+```
+
+## 6.2 Table B. Which emotion carries the interaction?
+
+The decomposition into six discrete emotions shows the negative interaction of Table A is almost entirely an anger interaction: emotionally angry misinformation is associated with fewer net votes, while the other five emotion interactions are null. This connects to the excluded outrage classifier (section 8.6): outrage could not be measured directly, but anger, its nearest available dimension, is exactly where the misinformation interaction concentrates.
+
+```{r}
+#| label: tableB
+for (dv in keep_dvs) print(show_family(famB, dv, "Table B", "B"))
+```
+
+```{r}
+tabB_slide <- modelsummary(
+  list(
+    "(3) core adjusted" = famB("log_net_votes")[[3]],
+    "(4) author FE"     = famB("log_net_votes")[[4]]
+  ),
+  stars = TRUE,
+  coef_map = cmap[c(
+    "anger_z",
+    "misinformation:anger_z",
+    "misinformation:disgust_z",
+    "misinformation:fear_z",
+    "misinformation:joy_z",
+    "misinformation:sadness_z",
+    "misinformation:surprise_z"
+  )],
+  gof_map = c("nobs"),
+  output = "gt",
+  title = "Table B (excerpt). Which emotion carries the interaction?"
+)
+
+gtsave(
+  tabB_slide,
+  "slides_tabB.png",
+  expand = 10,
+  vwidth = 800
+)
+```
+
+## 6.3 Table C. The five accuracy levels
+
+The five-level view shows the sharp engagement drop is confined to pants_on_fire, and the companion below reports, for all five levels, the adjusted level and the emotional-language slope inside each label from the column 3 model. Note the slope pattern: the emotional language premium lives in mostly_true posts and is absent for fully true ones, which suggests the premium attaches to opinionated but broadly accurate commentary as a genre rather than to accuracy itself. The five-level author-FE column is read cautiously given the thin within-author cells documented in section 5.
+
+```{r}
+#| label: tableC
+for (dv in keep_dvs) print(show_family(famC, dv, "Table C", "C"))
+```
+
+```{r}
+#| label: tableC-companion
+acc_companion <- function(dv) {
+  m  <- famC(dv)[["(3) + controls + FE"]]
+  nd <- model_data |> filter(!is.na(accuracy_5))
+  slp <- avg_slopes(m, variables = "emo_z", by = "accuracy_5", newdata = nd) |>
+    as_tibble() |>
+    transmute(accuracy_5 = as.character(accuracy_5),
+              emo_slope = estimate, emo_slope_se = std.error, emo_slope_p = p.value)
+  prd <- avg_predictions(m, by = "accuracy_5", newdata = nd, vcov = FALSE) |>
+    as_tibble() |>
+    transmute(accuracy_5 = as.character(accuracy_5), adj_mean = estimate)
+  left_join(prd, slp, by = "accuracy_5") |>
+    mutate(accuracy_5 = factor(accuracy_5, levels = acc5_order, labels = acc5_labs)) |>
+    arrange(accuracy_5)
+}
+comp_nv <- acc_companion("log_net_votes")
+print(comp_nv)
+
+# Figure: the per-label emotional-language slope, the H2 story in one panel.
+comp_nv |>
+  mutate(lo = emo_slope - 1.96 * emo_slope_se,
+         hi = emo_slope + 1.96 * emo_slope_se) |>
+  ggplot(aes(emo_slope, accuracy_5)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.2, colour = "grey35") +
+  geom_point(size = 3, colour = "#1F4E79") +
+  labs(title = "Emotional-language slope by accuracy label (net votes)",
+       subtitle = "Column 3 model; per SD of emotional language, 95% intervals",
+       x = "Slope on log(net votes + 1)", y = NULL) +
+  theme_pres(11)
+save_fig("figC_per_label_slopes.png", w = 7, h = 4)
+```
+
+## 6.4 Figures: the confirmatory story at a glance
+
+The coefficient ladder shows the three confirmatory terms across the four specifications; the interaction plot shows the surviving column 3 finding; the binned scatter makes the within-author null visible rather than merely stated.
+
+```{r}
+#| label: fig-ladder
+#| fig-width: 11
+#| fig-height: 7
+tidy_ladder <- function(fam_list, terms) {
+  purrr::imap_dfr(fam_list, function(m, nm) {
+    ct <- as.data.frame(fixest::coeftable(m)); ct$term <- rownames(ct)
+    ct |>
+      filter(term %in% terms) |>
+      transmute(spec = nm, term, estimate = Estimate, se = `Std. Error`,
+                p = `Pr(>|t|)`, lo = estimate - 1.96 * se, hi = estimate + 1.96 * se)
+  })
+}
+plot_ladder <- function(fam, dv, term_labels, title, code) {
+  d <- tidy_ladder(fam(dv), names(term_labels)) |>
+    mutate(term_label = factor(term_labels[term], levels = unname(term_labels)),
+           spec = factor(spec, levels = rev(unique(spec))), sig = p < .05)
+  g <- ggplot(d, aes(estimate, spec)) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "grey55") +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.18,
+                   linewidth = 0.45, colour = "grey35") +
+    geom_point(aes(fill = sig), shape = 21, size = 2.7, colour = "grey20", stroke = 0.4) +
+    scale_fill_manual(values = c(`TRUE` = "#1F4E79", `FALSE` = "white"),
+                      labels = c(`TRUE` = "p < .05", `FALSE` = "n.s."), name = NULL) +
+    facet_wrap(~ term_label, scales = "free_x") +
+    labs(title = paste0(title, " - ", dv_all[[dv]]),
+         subtitle = "Point estimates with 95% intervals across specifications (1) to (4)",
+         x = "Coefficient", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text = element_text(face = "bold", size = 9),
+          plot.title = element_text(face = "bold"), legend.position = "bottom")
+  print(g)
+  ggsave(file.path(pdf_dir, paste0(code, "_", sub("^log_", "", dv), "_coefplot.png")),
+         g, width = 11, height = 7, dpi = 300)
+  invisible(g)
+}
+labs_A <- c("misinformation"       = "Misinformation",
+            "emo_z"                = "Emotional language (z)",
+            "misinformation:emo_z" = "Misinfo x Emo. language")
+for (dv in keep_dvs) plot_ladder(famA, dv, labs_A, "Figure A. Confirmatory ladder", "figA")
+```
+
+```{r}
+#| label: fig-interaction
+#| fig-width: 7
+#| fig-height: 4.5
+# marginaleffects cannot propagate uncertainty for ABSORBED fixed effects,
+# so the plotting model refits column (3) with category and month as
+# explicit factor dummies: numerically the same regression, but the
+# dummies are ordinary coefficients and honest HC1 bands are available.
+m3_plot <- feols(log_net_votes ~ misinformation * emo_z + log_len +
+                   is_political + factor(category) + factor(month),
+                 data = model_data, vcov = se_main, notes = FALSE)
+plot_data <- plot_predictions(m3_plot,
+  condition = list("emo_z" = seq(-2, 2, 0.1), "misinformation" = c(0, 1)),
+  vcov = "HC1", draw = FALSE)
+ggplot(plot_data,
+       aes(emo_z, estimate,
+           colour = factor(misinformation, levels = c(0, 1),
+                           labels = c("Accurate", "Misinformation")),
+           fill   = factor(misinformation, levels = c(0, 1),
+                           labels = c("Accurate", "Misinformation")))) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = acc_cols, name = NULL) +
+  scale_fill_manual(values = acc_cols, guide = "none") +
+  labs(title = "Emotional language and approval, by accuracy",
+       subtitle = "Predicted log net votes, column (3) specification, 95% CIs",
+       x = "Emotional language (z)", y = "Predicted log(net votes + 1)") +
+  theme_pres()
+save_fig("figA_interaction_netvotes.png")
+```
+
+```{r}
+#| label: fig-within-binscatter
+#| fig-width: 7
+#| fig-height: 4.5
+within_d <- model_data |>
+  group_by(author) |> filter(n() >= 2) |>
+  mutate(y_w = log_net_votes - mean(log_net_votes),
+         x_w = emo_z - mean(emo_z)) |>
+  ungroup() |>
+  filter(between(x_w, quantile(x_w, .025), quantile(x_w, .975)))
+ggplot(within_d, aes(x_w, y_w)) +
+  stat_summary_bin(fun = mean, bins = 20, geom = "point",
+                   size = 2.2, colour = "#1F4E79") +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey30", linewidth = 0.5) +
+  labs(title = "Within-author variation: emotional language and approval",
+       subtitle = "Author-demeaned values, binned means (20 bins), inner 95% of x",
+       x = "Emotional language (z), within-author",
+       y = "log(net votes + 1), within-author") +
+  theme_pres()
+save_fig("figA_within_author_binscatter.png")
+```
+
+## 6.5 What section 6 establishes
+
+H1 is not supported at any layer. The raw penalty in column 1 is composition; the adjusted estimate is indistinguishable from zero and robust to the Poisson functional form (section 9.1); the within-author estimate is a precise null resting on the well-verified variation of section 5; and the diffusion outcome is null throughout, with the log-count companion (section 9.5) showing the same, so misinformation is not reblogged more. H2 is partially contradicted in an informative direction: emotional language is associated with more approval only for broadly accurate content, the penalty for emotional misinformation is specifically an anger penalty, and the premium concentrates in mostly_true posts. Both patterns are between-author patterns that vanish within authors, and the asymmetry appears only in approval, the tokenized action that allocates rewards, not in diffusion, which carries no direct reward. Whether that between-author asymmetry reflects content or the authors behind it is the question section 7 answers.
+
+# 7. What drives engagement on Hive
+
+## 7.1 Engagement follows authors
+
+```{r}
+#| label: author-dominance
+#| fig-width: 7
+#| fig-height: 4
+share_out <- c(log_net_votes = "Net votes", log_reblogs = "Reblogs",
+               log_payout = "Payout", log_comments = "Comments",
+               log_downvotes = "Downvotes")
+var_share_author <- function(v) {
+  d <- model_data |> select(author, all_of(v)) |>
+    rename(y = !!sym(v)) |> filter(is.finite(y))
+  grand <- mean(d$y); sst <- sum((d$y - grand)^2)
+  ssb <- d |> group_by(author) |>
+    summarise(n = n(), m = mean(y), .groups = "drop") |>
+    summarise(ssb = sum(n * (m - grand)^2)) |> pull(ssb)
+  ssb / sst
+}
+auth_share <- tibble(label = unname(share_out),
+                     share = map_dbl(names(share_out), var_share_author)) |>
+  mutate(label = fct_reorder(label, share))
+ggplot(auth_share, aes(share, label)) +
+  geom_col(fill = "#4C72B0", width = 0.65) +
+  geom_text(aes(label = scales::percent(share, accuracy = 1)), hjust = -0.15, size = 3.5) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Share of engagement variance explained by author identity",
+       subtitle = "One-way decomposition by author; the remainder is within-author variation",
+       x = "Between-author share of variance", y = NULL) +
+  theme_pres(11)
+save_fig("author_variance_share.png", w = 7, h = 4)
+```
+
+```{r}
+#| label: engagement-concentration
+#| fig-width: 6.5
+#| fig-height: 5
+auth_eng <- model_data |>
+  group_by(author) |>
+  summarise(eng = sum(pmax(net_votes, 0), na.rm = TRUE), .groups = "drop") |>
+  arrange(eng)
+ev <- auth_eng$eng; nA <- length(ev)
+gini <- (2 * sum(seq_len(nA) * ev) / (nA * sum(ev))) - (nA + 1) / nA
+lor  <- tibble(cum_authors = seq_len(nA) / nA, cum_eng = cumsum(ev) / sum(ev))
+ggplot(lor, aes(cum_authors, cum_eng)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(color = "#B2182B", linewidth = 1.1) +
+  annotate("text", x = 0.04, y = 0.92, hjust = 0,
+           label = sprintf("Gini = %.2f", gini), fontface = "bold", size = 4.2) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "A few authors receive most of the engagement",
+       subtitle = "Cumulative share of net votes across authors; dashed line is equality",
+       x = "Cumulative share of authors", y = "Cumulative share of net votes") +
+  theme_pres(11)
+save_fig("desc_engagement_concentration.png", w = 6.5, h = 5)
+```
+
+## 7.2 Isolating the author-FE contribution (same-sample check)
+
+Columns 3 and 4 of Table A differ in sample as well as specification: single-post authors drop out under author fixed effects. Re-running column 3 on the column 4 sample separates the two. The result is diagnostic: the emotional language main effect already fades on the restricted sample, so its column 3 strength is carried substantially by single-appearance authors, while the interaction survives the restriction and dies only when author effects enter, making it a genuinely between-author pattern among multi-post authors.
+
+```{r}
+#| label: same-sample
+f_col3 <- log_net_votes ~ misinformation * emo_z + log_len + is_political | category + month
+f_col4 <- log_net_votes ~ misinformation * emo_z + log_len + is_political | category + month + author
+m3f <- feols(f_col3, data = model_data, vcov = se_main, notes = FALSE)
+m4f <- feols(f_col4, data = model_data, vcov = se_main, notes = FALSE)
+col4_sample <- model_data[obs(m4f), ]
+m3_sub <- feols(f_col3, data = col4_sample, vcov = se_main, notes = FALSE)
+tabR1 <- modelsummary(
+  list("(3) full sample" = m3f, "(3) col-4 sample" = m3_sub, "(4) author FE" = m4f),
+  stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z", "log_len")],
+  gof_map = c("nobs", "r.squared", "r2.within"),
+  title = "Table R1. Isolating the author-FE contribution (net votes)")
+if (save_pdf) tryCatch(gt::gtsave(tabR1, file.path(pdf_dir, "R1_same_sample.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabR1
+```
+
+## 7.3 Decomposing the author effect: pre-window standing
+
+The four pre-window standing measures are added to the core model. Because every measure is built exclusively from operations dated before the observation window, none can mechanically contain the rewards of the posts under study, which removes the bad-control problem the scrape-time snapshots had. The quantity of interest is how far R2 moves from column 3 toward the author-FE ceiling: the movement measures how much of the author effect is captured by observable pre-window standing, and the remaining gap reflects other observed or unobserved author-level heterogeneity, such as network position, community ties, stable content quality, audience, or habitual style. One interpretive caution remains and is milder than before: pre-window standing reflects stable author quality and past success, so the (3b) misinformation and emotional-language coefficients are still read as descriptive adjustments rather than cleaner effect estimates. The individual standing coefficients are likewise not interpreted singly, because they are mutually conditional (for example, root-post count and account age enter net of accumulated rewards, so they capture reward-per-post efficiency rather than posting or tenure as such); the decomposition rests on the joint R2 movement, not on any one sign.
+
+```{r}
+#| label: stake-standing
+m3b <- feols(log_net_votes ~ misinformation * emo_z + log_len + is_political +
+               log_pre_rewards + log_pre_curation + log_pre_posts +
+               log_acct_age | category + month,
+             data = model_data, vcov = se_main, notes = FALSE)
+tabR2 <- modelsummary(
+  list("(3) core" = m3f, "(3b) + pre-window standing" = m3b, "(4) author FE" = m4f),
+  stars = TRUE, output = "gt",
+  coef_map = c(cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+               "log_pre_rewards"  = "log(pre-window author rewards)",
+               "log_pre_curation" = "log(pre-window curation rewards)",
+               "log_pre_posts"    = "log(pre-window root posts)",
+               "log_acct_age"     = "log(account age, days)"),
+  gof_map = c("nobs", "r.squared", "r2.within"),
+  title = "Table R2. How much of the author effect is pre-window standing?",
+  notes = "Standing measured strictly before the observation window from HiveSQL operation tables; it cannot contain the sampled posts' own rewards. The (3b) accuracy and emotional-language coefficients remain descriptive.")
+if (save_pdf) tryCatch(gt::gtsave(tabR2, file.path(pdf_dir, "R2_stake_standing.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabR2
+```
+
+Reading: the four pre-window standing measures move R2 from .151 to .597, accounting for roughly 60 percent of the additional explanatory power between the core model and the author fixed-effect specification; the remaining gap reflects other observed or unobserved author-level heterogeneity. The decline of the emotional language main effect from .107 to .008 indicates substantial overlap between the between-author emotional language association and pre-existing standing; the standing-adjusted coefficient is not read as a cleaner effect estimate. The interaction is the one confirmatory term that survives standing adjustment (-.103) before vanishing within authors, so the accuracy asymmetry is a between-author pattern but not merely a standing pattern. The individual standing coefficients are not read singly, as noted above; in particular the negative conditional signs on root posts and account age reflect reward-per-post efficiency given accumulated rewards, not any penalty to posting or tenure.
+
+## 7.4 Composition placebo: the author profile of misinformation posts
+
+If the raw misinformation penalty is composition, the authors behind misinformation and accurate posts should differ in pre-window standing, and regressing the standing measures on the misinformation flag compares exactly that. Because standing is built only from operations dated before the window, the sampled posts cannot influence these measures, so pre-determination holds by construction. Two limits on interpretation apply nonetheless: this is a post-level composition analysis rather than an author-level analysis of misinformation propensity, and prolific authors contribute more observations, so the estimates are weighted toward active accounts. Positive coefficients therefore say that misinformation posts in this analysis sample are associated with higher-standing authors; they do not establish that established authors are more inclined to produce misinformation.
+
+```{r}
+#| label: placebo
+plc <- list(
+  "log(pre-window author rewards)"   =
+    feols(log_pre_rewards  ~ misinformation | category + month,
+          data = model_data, vcov = se_main, notes = FALSE),
+  "log(pre-window curation rewards)" =
+    feols(log_pre_curation ~ misinformation | category + month,
+          data = model_data, vcov = se_main, notes = FALSE),
+  "log(pre-window root posts)"       =
+    feols(log_pre_posts    ~ misinformation | category + month,
+          data = model_data, vcov = se_main, notes = FALSE),
+  "log(account age)"                 =
+    feols(log_acct_age     ~ misinformation | category + month,
+          data = model_data, vcov = se_main, notes = FALSE))
+tabR3 <- modelsummary(plc, stars = TRUE, output = "gt",
+  coef_map = c("misinformation" = "Misinformation"),
+  gof_map = c("nobs", "r.squared"),
+  title = "Table R3. Author composition placebo (pre-window standing)",
+  notes = "Standing measured strictly before the observation window; pre-determined by construction. Positive coefficients indicate that misinformation posts in this analysis sample come from authors with higher pre-window standing; the estimates describe post-level author composition, not author-level misinformation propensity.")
+if (save_pdf) tryCatch(gt::gtsave(tabR3, file.path(pdf_dir, "R3_placebo.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabR3
+```
+
+Reading: misinformation posts in the analysis sample are associated with authors who have more pre-window author rewards, more prior root posts, and older accounts; curation rewards show no difference, which is coherent because curation tracks voting activity rather than authorship. The pattern may partly reflect greater posting exposure among prolific accounts, and the sampling gate selects claim-bearing political and current-events content that established accounts produce more of. What the result does support is a composition statement: misinformation in this sample is not confined to new or marginal accounts. It is a statement about origin, not intent or propensity. Whether any accounts deliberately exploit standing to spread inaccurate content profitably cannot be established from post-level field data; section 7.4b tests the observable implications, and the question otherwise requires experimental or account-level longitudinal designs and is left to future research.
+
+## 7.4b Does misinformation pay? Payout and standing heterogeneity (exploratory)
+
+Two observable implications of a strategic-monetization account can be tested. First, if misinformation is financially rewarded, misinformation posts should earn higher payouts; payout was excluded as a primary outcome because it is mechanically downstream of votes, but for this targeted question it is exactly the right variable. Second, if established accounts specifically can monetize misinformation, the misinformation association should turn positive at high pre-window standing, which an interaction with pre-window author rewards tests. Both models are exploratory and read with the same caution as everything in this section. Note the within-author null of Table A already constrains the strategic story: mixed authors' misinformation does not outperform their own accurate posts, so any strategic mechanism would have to operate at the account level rather than the post level.
+
+```{r}
+#| label: payout-heterogeneity
+famPay <- famA("log_payout")
+m_het  <- feols(log_net_votes ~ misinformation * log_pre_rewards + emo_z +
+                  log_len + is_political | category + month,
+                data = model_data, vcov = se_main, notes = FALSE)
+tabR4 <- modelsummary(
+  list("Payout (3)" = famPay[["(3) + controls + FE"]],
+       "Payout (4)" = famPay[["(4) + author FE"]],
+       "Net votes: standing heterogeneity (3)" = m_het),
+  stars = TRUE, output = "gt",
+  coef_map = c("misinformation"                  = "Misinformation",
+               "emo_z"                           = "Emotional language (z)",
+               "misinformation:emo_z"            = "Misinformation x Emo. language",
+               "log_pre_rewards"                 = "log(pre-window author rewards)",
+               "misinformation:log_pre_rewards"  = "Misinformation x Pre-window rewards"),
+  gof_map = c("nobs", "r.squared", "r2.within"),
+  title = "Table R4. Payout and standing heterogeneity (exploratory)",
+  notes = "Payout is mechanically downstream of votes and is used here only for this targeted question. The heterogeneity model asks whether the misinformation association differs by pre-window standing.")
+if (save_pdf) tryCatch(gt::gtsave(tabR4, file.path(pdf_dir, "R4_payout_heterogeneity.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabR4
+```
+
+Reading: if the payout estimates are null in both columns and the heterogeneity interaction is null, the monetary version of the amplification hypothesis is closed at every observable margin, and the strategic-account question is framed honestly as future research with a policy observation: content moderation on stake-weighted platforms should not assume misinformation comes from new or peripheral accounts. If the heterogeneity interaction is positive and credible, it is reported as an exploratory finding with explicit multiple-testing caution and no causal language.
+
+## 7.5 What section 7 establishes
+
+Author identity absorbs the large majority of engagement variance, and a substantial share of that author effect is accounted for by observable pre-window standing in the stake-weighted system. Misinformation posts in the sample are associated with authors of higher pre-window standing (more accumulated author rewards, more prior posts, older accounts; curation rewards show no difference), so the raw between-author comparison mixes a standing premium with whatever accuracy response exists. Together these results give the platform-mechanism reading of the confirmatory nulls: engagement on Hive is more strongly associated with accumulated author standing than with the measured post-level content features.
+
+# 8. Exploratory analysis: dispersion, valence, and identity language
+
+Three questions promised a closer look, each with its own subsection and a consistent format: the family alone, columns 3 and 4 side by side, one reading paragraph. Two bridge diagnostics (E4 and E5) then connect the emotional-dynamics measures directly back to the confirmatory Table A, separating what changes because of the smaller dynamics sample, the sentence-level measurement, and the addition of movement or valence. A compact figure at the end shows the between-vs-within contrasts at a glance. The volatility measures follow the sentiment volatility formula of Berger et al. (2021), the standard deviation of differences between adjacent segments; the valence version adapts their construct directly, since their measure is defined over sentiment, while the emotional-language version transfers the same logic to a different dimension, and in both cases the segment is the sentence, a finer unit than the 500-word chunks and paragraphs used in the original. Dispersion (the standard deviation of the scores themselves) and volatility are conceptually distinct, because dispersion ignores the ordering of sentences, but they are statistically inseparable in this corpus (r = .82 for emotional language, .84 for valence), so each model uses one of the pair; agreement across the two variants supports that a result is not an artifact of a single operationalisation.
+
+## 8.1 Emotional language: mean vs movement
+
+```{r}
+#| label: e1-dispersion
+famE1   <- fit_specs("log_net_votes", "emean_z + esd_z",  data = exp_dyn)
+famE1v  <- fit_specs("log_net_votes", "emean_z + evol_z", data = exp_dyn)
+famE1r  <- fit_specs("any_reblog",    "emean_z + esd_z",  data = exp_dyn)
+famE1rv <- fit_specs("any_reblog",    "emean_z + evol_z", data = exp_dyn)
+tabE1 <- modelsummary(
+  list("NV, dispersion (3)" = famE1[[3]],   "NV, dispersion (4)" = famE1[[4]],
+       "NV, volatility (3)" = famE1v[[3]],  "NV, volatility (4)" = famE1v[[4]],
+       "AR, dispersion (3)" = famE1r[[3]],  "AR, dispersion (4)" = famE1r[[4]],
+       "AR, volatility (3)" = famE1rv[[3]], "AR, volatility (4)" = famE1rv[[4]]),
+  stars = TRUE, output = "gt",
+  coef_map = c("emean_z" = "Emotional language mean (z)",
+               "esd_z"   = "Emotional language dispersion (z)",
+               "evol_z"  = "Emotional language volatility (z)"),
+  gof_map = c("nobs", "r2.within"),
+  title = "Table E1. Mean vs movement of emotional language (alternative operationalisations)",
+  notes = "NV = net votes, AR = any reblog. Sentence-level measures (related to but distinct from the post-level confirmatory variable, r = .72). Dispersion is the standard deviation of sentence scores; volatility is the standard deviation of differences between consecutive sentence scores, the sentiment volatility formula of Berger et al. (2021) applied to emotional language at the sentence level. The two are conceptually distinct but correlate at .82 here and are fit separately; agreement across variants supports that the associations are not artifacts of a single operationalisation. Columns (3): controls + category and month FE. Columns (4): author FE.")
+if (save_pdf) tryCatch(gt::gtsave(tabE1, file.path(pdf_dir, "E1_dispersion.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabE1
+```
+
+Reading: across both movement operationalisations, greater emotional-language movement is positively associated with net votes between authors, and conditional on movement, a higher average emotional-language level is negatively associated with net votes. The agreement across variants supports that this is not an artifact of a single measurement choice. All estimates are null under author fixed effects, which suggests the associations primarily reflect differences in authors' typical writing styles rather than a within-author post-level advantage that a writer could act on.
+
+## 8.2 Valence: level and movement
+
+```{r}
+#| label: e2-valence
+famV_d  <- fit_specs("log_net_votes", "vmean_z + vsd_z",  data = exp_dyn)
+famV_v  <- fit_specs("log_net_votes", "vmean_z + vvol_z", data = exp_dyn)
+famV_dr <- fit_specs("any_reblog",    "vmean_z + vsd_z",  data = exp_dyn)
+tabE2 <- modelsummary(
+  list("NV, dispersion (3)" = famV_d[[3]],  "NV, dispersion (4)" = famV_d[[4]],
+       "NV, volatility (3)" = famV_v[[3]],  "NV, volatility (4)" = famV_v[[4]],
+       "Any reblog (3)"     = famV_dr[[3]], "Any reblog (4)"     = famV_dr[[4]]),
+  stars = TRUE, output = "gt",
+  coef_map = c("vmean_z" = "Valence mean (z)",
+               "vsd_z"   = "Valence dispersion (z)",
+               "vvol_z"  = "Valence volatility (z)"),
+  gof_map = c("nobs", "r2.within"),
+  title = "Table E2. Valence level and movement (alternative operationalisations)",
+  notes = "NV = net votes. Valence volatility is the standard deviation of adjacent-sentence differences in VADER compound scores, the direct sentence-level adaptation of the sentiment volatility measure of Berger et al. (2021). Dispersion and volatility correlate at .84 and are fit separately; agreement across variants supports that the associations are not artifacts of a single operationalisation.")
+if (save_pdf) tryCatch(gt::gtsave(tabE2, file.path(pdf_dir, "E2_valence.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabE2
+```
+
+Reading: the valence mean shows a small positive within-author association that is stable across operationalisations: when an author writes more positively than their own baseline, that post does slightly better. That the association appears under author fixed effects rather than dying there is interpretable: between authors, valence is entangled with author style and topic (it correlates -.41 with the political flag), and demeaning strips that confound, leaving a small clean within signal. The movement measures are negative for diffusion between authors and null within; where the dispersion and volatility variants disagree, no claim is made.
+
+## 8.3 Table E4. Does emotional-language movement change the original Table A result?
+
+E1 reports the standalone associations of the sentence-level measures. This section asks the bridge question: does the confirmatory Table A pattern change once the emotional-dynamics measurement enters, and if so, at which step? Three steps are separated, all on the common dynamics sample (`exp_dyn`) so that every model within a comparison uses identical rows. Model 1 reruns the exact Table A specification on the dynamics sample, isolating pure sample restriction. Model 2 replaces the chunk-and-average confirmatory score (`emo_z`) with the boilerplate-filtered sentence-level mean (`emean_z`), isolating the measurement change; the two scores target the same construct (emotional vs neutral language, not valence) but correlate at only .72. Models 3 and 4 then add dispersion or volatility as explanatory variables, in alternative specifications because the two movement measures correlate at .82; no misinformation interactions with movement are added, since the question is whether the original misinformation-by-emotional-language pattern survives the presence of movement, not whether a new interaction exists. These are exploratory diagnostic comparisons, not new confirmatory hypotheses, and all language is associative.
+
+```{r}
+#| label: e4-bridge
+mapE4 <- c(
+  "misinformation"          = "Misinformation",
+  "emo_z"                   = "Emotional language, chunk-based (z)",
+  "misinformation:emo_z"    = "Misinfo x Emo. language (chunk)",
+  "emean_z"                 = "Emotional language, sentence mean (z)",
+  "misinformation:emean_z"  = "Misinfo x Emo. language (sentence mean)",
+  "esd_z"                   = "Emotional language dispersion (z)",
+  "evol_z"                  = "Emotional language volatility (z)",
+  "log_len"                 = "log(length)")
+
+noteE4 <- paste(
+  "All models on the common dynamics sample (exp_dyn).",
+  "Model 1 isolates the effect of restricting Table A to the dynamics sample.",
+  "Model 2 isolates the change from the original chunk-based score to the sentence-level mean (r = .72 between the two).",
+  "Models 3 and 4 test whether adding dispersion or volatility changes the original interaction pattern;",
+  "they are alternative specifications because the two movement measures correlate at .82.",
+  "HC1 standard errors.")
+
+e4_fams <- function(dv) list(
+  "(1) Table A spec"     = fit_specs(dv, "misinformation*emo_z",             data = exp_dyn),
+  "(2) Sentence mean"    = fit_specs(dv, "misinformation*emean_z",           data = exp_dyn),
+  "(3) + dispersion"     = fit_specs(dv, "misinformation*emean_z + esd_z",   data = exp_dyn),
+  "(4) + volatility"     = fit_specs(dv, "misinformation*emean_z + evol_z",  data = exp_dyn))
+
+bridge_panel <- function(fams, spec_name, title, tag, map, note) {
+  mods <- lapply(fams, function(f) f[[spec_name]])
+  tab <- modelsummary(mods, stars = TRUE, output = "gt", coef_map = map,
+                      gof_map = c("nobs", "r.squared", "r2.within"),
+                      title = title, notes = note)
+  if (save_pdf) tryCatch(gt::gtsave(tab, file.path(pdf_dir, paste0(tag, ".pdf"))),
+                         error = function(e) message(conditionMessage(e)))
+  tab
+}
+
+famsE4_nv <- e4_fams("log_net_votes")
+famsE4_ar <- e4_fams("any_reblog")
+
+bridge_panel(famsE4_nv, "(3) + controls + FE",
+             "Table E4, Panel A. Net votes, specification (3)", "E4_A_netvotes_s3", mapE4, noteE4)
+bridge_panel(famsE4_nv, "(4) + author FE",
+             "Table E4, Panel B. Net votes, specification (4)", "E4_B_netvotes_s4", mapE4, noteE4)
+bridge_panel(famsE4_ar, "(3) + controls + FE",
+             "Table E4, Panel C. Any reblog, specification (3)", "E4_C_anyreblog_s3", mapE4, noteE4)
+bridge_panel(famsE4_ar, "(4) + author FE",
+             "Table E4, Panel D. Any reblog, specification (4)", "E4_D_anyreblog_s4", mapE4, noteE4)
+```
+
+\[PENDING FIRST RENDER\] Reading to be written from the rendered panels, answering, in order: (1) does the Table A misinformation-by-emotional-language interaction survive when Table A is rerun on the dynamics sample; (2) does replacing the chunk-based score with the sentence-level mean change the coefficient or its significance; (3) does adding dispersion materially move the misinformation, sentence-mean, or interaction coefficients; (4) does adding volatility; (5) do any apparent differences remain under author fixed effects. No claim that movement changes the Table A result will be made unless the coefficients move meaningfully in the rendered output.
+
+## 8.4 Table E5. Do valence level and valence movement account for the original Table A pattern?
+
+E4 varies the emotional-language measurement; E5 keeps the original Table A variables intact in every model and asks instead whether signed valence explains the pattern. Emotional language measures emotional vs neutral language and is unsigned; the VADER compound score measures positive-to-negative valence and is signed, so the two are conceptually distinct dimensions (they correlate at -.33 in this corpus). If the Table A emotional-language coefficients shrink once valence level or valence movement enters, the original pattern partly reflects valence rather than emotionality per se. The VADER volatility variable is the closer adaptation of Berger et al.'s (2021) original valence-based construct. No misinformation-by-valence interactions are added; the question is whether valence accounts for the existing pattern, not whether a new interaction exists. Dispersion and volatility again enter as alternatives (r = .84). All models on `exp_dyn`, associative language throughout.
+
+```{r}
+#| label: e5-bridge
+mapE5 <- c(
+  "misinformation"       = "Misinformation",
+  "emo_z"                = "Emotional language (z)",
+  "misinformation:emo_z" = "Misinformation x Emo. language",
+  "vmean_z"              = "Valence mean (z)",
+  "vsd_z"                = "Valence dispersion (z)",
+  "vvol_z"               = "Valence volatility (z)",
+  "log_len"              = "log(length)")
+
+noteE5 <- paste(
+  "All models on the common dynamics sample (exp_dyn); Table A variables retained throughout.",
+  "VADER compound provides a signed sentence-level valence score from negative to positive:",
+  "vmean_z is the average, vsd_z the dispersion of sentence scores without regard to order,",
+  "and vvol_z the Berger-style volatility, the standard deviation of changes between consecutive sentence scores.",
+  "Models 3 and 4 are alternative specifications because valence dispersion and volatility correlate at .84.",
+  "The comparison tests whether valence level and movement account for the original Table A emotional-language coefficients.",
+  "HC1 standard errors.")
+
+e5_fams <- function(dv) list(
+  "(1) Table A spec"   = fit_specs(dv, "misinformation*emo_z",                     data = exp_dyn),
+  "(2) + valence mean" = fit_specs(dv, "misinformation*emo_z + vmean_z",           data = exp_dyn),
+  "(3) + dispersion"   = fit_specs(dv, "misinformation*emo_z + vmean_z + vsd_z",   data = exp_dyn),
+  "(4) + volatility"   = fit_specs(dv, "misinformation*emo_z + vmean_z + vvol_z",  data = exp_dyn))
+
+famsE5_nv <- e5_fams("log_net_votes")
+famsE5_ar <- e5_fams("any_reblog")
+
+bridge_panel(famsE5_nv, "(3) + controls + FE",
+             "Table E5, Panel A. Net votes, specification (3)", "E5_A_netvotes_s3", mapE5, noteE5)
+bridge_panel(famsE5_nv, "(4) + author FE",
+             "Table E5, Panel B. Net votes, specification (4)", "E5_B_netvotes_s4", mapE5, noteE5)
+bridge_panel(famsE5_ar, "(3) + controls + FE",
+             "Table E5, Panel C. Any reblog, specification (3)", "E5_C_anyreblog_s3", mapE5, noteE5)
+bridge_panel(famsE5_ar, "(4) + author FE",
+             "Table E5, Panel D. Any reblog, specification (4)", "E5_D_anyreblog_s4", mapE5, noteE5)
+```
+
+\[PENDING FIRST RENDER\] Reading to be written from the rendered panels, reporting, in order: (1) whether adding average valence changes the Table A misinformation, emotional-language, or interaction coefficients; (2) whether valence dispersion changes them further; (3) whether valence volatility changes them further; (4) whether the valence variables themselves remain associated with engagement under author fixed effects, where the E2 within-author valence-mean result gives the prior expectation; (5) whether the reading differs between net votes and any reblog. The final thesis conclusion is not revised until these panels are inspected.
+
+## 8.5 Political identity references (Rathje et al., 2021)
+
+```{r}
+#| label: e3-political
+famP  <- fit_specs("log_net_votes", "pol_z")
+famPd <- fit_specs("log_net_votes", "pol_dens_z")
+famPs <- fit_specs("log_net_votes", "pol_z",
+                   data = model_data |> filter(is_political == 1))
+tabE3 <- modelsummary(
+  list("Count form (3)"     = famP[[3]],  "Count form (4)"     = famP[[4]],
+       "Density form (3)"   = famPd[[3]], "Density form (4)"   = famPd[[4]],
+       "Political only (3)" = famPs[[3]], "Political only (4)" = famPs[[4]]),
+  stars = TRUE, output = "gt",
+  coef_map = c("pol_z"      = "Political identity refs (z)",
+               "pol_dens_z" = "Political identity refs, density (z)"),
+  gof_map = c("nobs", "r2.within"),
+  title = "Table E3. Political identity references and approval (net votes)",
+  notes = "Between-author estimates (columns 3) vary in sign across operationalisations; within-author estimates (columns 4) are consistently negative.")
+if (save_pdf) tryCatch(gt::gtsave(tabE3, file.path(pdf_dir, "E3_political.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabE3
+```
+
+Reading: the between-author association is fragile and specification-dependent, while the within-author association is consistently negative and modest, roughly a 3 to 4 percent decline in net votes per standard deviation of identity references. This pattern differs from the sharing premium for out-group language reported on centralized platforms (Rathje et al., 2021). Two platform features may contribute: Hive's feed is not engagement-optimised, so identity-charged content receives no algorithmic amplification, and stake-weighted votes deplete voting power and allocate real rewards, so an upvote is closer to a small payment than a costless reaction. A measurement caveat applies: the variable counts identity references overall, not out-group derogation specifically, so the construct overlap with Rathje et al. is partial.
+
+## 8.6 The digital outrage classifier: a negative methods result
+
+No code runs here by design. The Brady et al. (2021) classifier was validated on manually labelled Hive sentences and agreed on 29 of 30 non-outrage labels but only 7 of 30 outrage labels, with errors concentrated in gaming, technical, and everyday content that contains conflict vocabulary (attack, destroy, kill) without moral violation. This is a domain-transfer failure: the classifier was trained on US political Twitter and misreads Hive's platform culture, and Brady et al. themselves note that validity should be re-established when the tool is applied to new domains. The classifier was therefore excluded because it did not demonstrate adequate domain validity on Hive, and moral outrage is not measured directly in the present study. Anger is reported as a related but conceptually narrower emotion dimension: moral outrage in Brady et al.'s framework combines a perceived moral violation with anger, disgust, or contempt and an orientation toward blame, so the anger findings in Table B are informative about one component of the construct and are not treated as a substitute for it.
+
+## 8.7 One figure for the section
+
+```{r}
+#| label: fig-explore-compact
+#| fig-width: 9
+#| fig-height: 4.5
+pull_term <- function(m, term, spec, family) {
+  ct <- as.data.frame(fixest::coeftable(m)); ct$t <- rownames(ct)
+  ct <- ct[ct$t == term, ]
+  if (!nrow(ct)) return(NULL)
+  tibble(family, spec, estimate = ct$Estimate, se = ct$`Std. Error`)
+}
+comp <- bind_rows(
+  pull_term(famE1[[3]], "esd_z",   "Between (col 3)", "Emo. language dispersion"),
+  pull_term(famE1[[4]], "esd_z",   "Within (col 4)",  "Emo. language dispersion"),
+  pull_term(famV_d[[3]], "vmean_z", "Between (col 3)", "Valence mean"),
+  pull_term(famV_d[[4]], "vmean_z", "Within (col 4)",  "Valence mean"),
+  pull_term(famP[[3]],  "pol_z",   "Between (col 3)", "Political identity refs"),
+  pull_term(famP[[4]],  "pol_z",   "Within (col 4)",  "Political identity refs")) |>
+  mutate(lo = estimate - 1.96 * se, hi = estimate + 1.96 * se)
+ggplot(comp, aes(estimate, family, colour = spec)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.18,
+                 position = position_dodge(width = 0.5), linewidth = 0.5) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.6) +
+  scale_colour_manual(values = c("Between (col 3)" = "#8DA9C4",
+                                 "Within (col 4)"  = "#1F4E79"), name = NULL) +
+  labs(title = "Exploratory associations: between vs within authors",
+       subtitle = "Net votes; 95% intervals; per SD of each predictor",
+       x = "Coefficient (log net votes)", y = NULL) +
+  theme_pres()
+save_fig("figE_compact_between_within.png", w = 9, h = 4.5)
+```
+
+# 9. Robustness
+
+Each check targets one named threat. Only the misinformation and interaction terms are displayed; full tables are written to `regression_pdfs/`.
+
+## 9.1 Functional form: Poisson on raw counts
+
+The log1p transformation is a modelling choice; Poisson pseudo-maximum-likelihood on the raw counts handles zeros natively and does not depend on it. Net votes cannot serve directly because it is upvotes minus downvotes and takes negative values on some posts, which the Poisson family does not allow, and dropping those posts would select on the outcome. Raw upvotes is a true nonnegative count that correlates near 1 with net votes because downvotes are rare, so the Poisson check runs on upvotes. Note `fepois` drops author groups whose outcome is all zeros in the FE column, so its N is slightly smaller.
+
+```{r}
+#| label: rob-poisson
+cat("Posts with negative net votes:",
+    sum(model_data$net_votes < 0, na.rm = TRUE), "of", nrow(model_data), "\n")
+m3_pois <- fepois(upvotes ~ misinformation * emo_z + log_len + is_political |
+                    category + month, data = model_data, vcov = se_main, notes = FALSE)
+m4_pois <- fepois(upvotes ~ misinformation * emo_z + log_len + is_political |
+                    category + month + author, data = model_data, vcov = se_main, notes = FALSE)
+tabRob1 <- modelsummary(
+  list("Poisson (3)" = m3_pois, "Poisson (4)" = m4_pois),
+  stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+  gof_map = c("nobs"),
+  title = "Table Rob1. Poisson PML on raw upvotes")
+if (save_pdf) tryCatch(gt::gtsave(tabRob1, file.path(pdf_dir, "Rob1_poisson.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob1
+```
+
+## 9.2 Measurement: strict labels and model3-only labels
+
+Classification error in the pipeline labels attenuates coefficients toward zero, so the null is checked under the stricter label and under model3-only labels (excluding the 168 model1-fallback posts). The human validation study addresses the same threat from the annotation side.
+
+```{r}
+#| label: rob-labels
+m3_strict <- feols(log_net_votes ~ misinformation_strict * emo_z + log_len +
+                     is_political | category + month,
+                   data = model_data |> filter(!is.na(misinformation_strict)),
+                   vcov = se_main, notes = FALSE)
+m3_model3 <- feols(f_col3, data = model_data |> filter(label_source == "model3"),
+                   vcov = se_main, notes = FALSE)
+tabRob2 <- modelsummary(
+  list("(3) main" = m3f, "(3) strict labels" = m3_strict, "(3) model3 only" = m3_model3),
+  stars = TRUE, output = "gt",
+  coef_map = c("misinformation"               = "Misinformation",
+               "misinformation_strict"        = "Misinformation (strict)",
+               "emo_z"                        = "Emotional language (z)",
+               "misinformation:emo_z"         = "Misinfo x Emo. language",
+               "misinformation_strict:emo_z"  = "Misinfo (strict) x Emo. language"),
+  gof_map = c("nobs", "r.squared"),
+  title = "Table Rob2. Label robustness (net votes)")
+if (save_pdf) tryCatch(gt::gtsave(tabRob2, file.path(pdf_dir, "Rob2_labels.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob2
+```
+
+## 9.3 Outliers: winsorized outcome
+
+Hive engagement is heavy-tailed even after logging because stake-weighted whale votes concentrate approval. The outcome is winsorized at the 99th percentile; the null is more credible if it survives the outliers than if it depends on removing them, so this is a reported sensitivity, not a change to the primary specification.
+
+```{r}
+#| label: rob-winsor
+wz <- function(x, p = 0.99) pmin(x, quantile(x, p, na.rm = TRUE))
+m3_win <- feols(wz(log_net_votes) ~ misinformation * emo_z + log_len +
+                  is_political | category + month,
+                data = model_data, vcov = se_main, notes = FALSE)
+tabRob3 <- modelsummary(
+  list("(3) main" = m3f, "(3) winsorized 99%" = m3_win),
+  stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+  gof_map = c("nobs", "r.squared"),
+  title = "Table Rob3. Outlier sensitivity (net votes)")
+if (save_pdf) tryCatch(gt::gtsave(tabRob3, file.path(pdf_dir, "Rob3_winsor.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob3
+```
+
+## 9.4 Format controls: are the confirmatory estimates robust to presentation?
+
+Weekend timing, tags, links, and images are not confirmatory controls by design: a control must plausibly confound, meaning it must correlate with both accuracy and engagement, and the correlation table shows the format features barely differ by accuracy (all \|r\| with misinformation below .05). Adding them also changes the estimand to the accuracy association net of presentation choices, which are part of the post the author composed rather than background conditions, and the confirmatory specification was fixed before the format features were built. The check yields a split result: the misinformation estimate is unchanged, confirming the H1 null is not sensitive to presentation, while the emotional language main effect and the interaction fall below significance once format enters. The between-author emotional language pattern therefore partly overlaps with presentation-rich posts, and it is reported with that qualifier; whether format features are confounders to remove or components of the authored content that should not be conditioned on is left as an open interpretive question.
+
+```{r}
+#| label: rob-format
+m3_fmt <- feols(log_net_votes ~ misinformation * emo_z + log_len + is_political +
+                  img_z + lnk_z + tags_z + is_weekend | category + month,
+                data = model_data, vcov = se_main, notes = FALSE)
+tabRob4 <- modelsummary(
+  list("(3) main" = m3f, "(3) + format controls" = m3_fmt),
+  stars = TRUE, output = "gt",
+  coef_map = c(cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+               "img_z"      = "Images (z)",
+               "lnk_z"      = "Links (z)",
+               "tags_z"     = "Tags (z)",
+               "is_weekend" = "Weekend"),
+  gof_map = c("nobs", "r.squared"),
+  title = "Table Rob4. Format-feature controls (net votes)")
+if (save_pdf) tryCatch(gt::gtsave(tabRob4, file.path(pdf_dir, "Rob4_format.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob4
+```
+
+## 9.5 Reblogs, intensive margin (log count companion)
+
+The demoted log-count diffusion outcome, reported once for completeness. With \~73 percent zeros this model mostly re-expresses the extensive margin (r = .88 with any_reblog), which is why it is a companion rather than a main outcome.
+
+```{r}
+#| label: rob-reblogs-log
+tabRob5 <- modelsummary(famA("log_reblogs"), stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z", "log_len")],
+  gof_omit = gof_drop,
+  title = "Table Rob5. Reblogs, log count (companion to any reblog)")
+if (save_pdf) tryCatch(gt::gtsave(tabRob5, file.path(pdf_dir, "Rob5_reblogs_log.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob5
+```
+
+## 9.6 Period split (exploratory, read with caution)
+
+The confirmatory model re-fit on pre-election (Sep-Oct), election (Nov), and post-election (Dec-Jan) subsamples. Three periods and three terms invite multiple comparisons and no correction is applied, so isolated significant cells are not treated as findings; the purpose is to show the confirmatory patterns are broadly stable across the election timeline. The five-level table and author effects are omitted because the split cells are too thin.
+
+```{r}
+#| label: rob-period
+pd_data <- model_data |>
+  mutate(period = dplyr::recode(as.character(month),
+                                "2024-09" = "pre", "2024-10" = "pre",
+                                "2024-11" = "election",
+                                "2024-12" = "post", "2025-01" = "post"),
+         period = factor(period, levels = c("pre", "election", "post")))
+period_labs <- c(pre = "Pre (Sep-Oct)", election = "Election (Nov)", post = "Post (Dec-Jan)")
+pmods <- lapply(names(period_labs), function(p)
+  feols(f_col3, data = pd_data |> filter(period == p), vcov = se_main, notes = FALSE))
+names(pmods) <- period_labs
+tabRob6 <- modelsummary(pmods, stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+  gof_map = c("nobs", "r.squared"),
+  title = "Table Rob6. Period split (net votes), exploratory")
+if (save_pdf) tryCatch(gt::gtsave(tabRob6, file.path(pdf_dir, "Rob6_period.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob6
+```
+
+## 9.7 Sign-preserving transformations of net votes
+
+The primary outcome floors the 150 posts with negative net votes at zero before logging, since log1p is undefined below -1. Two transformations that preserve the sign and magnitude of negative values, the inverse hyperbolic sine and a signed log, check that this choice does not drive the confirmatory estimates.
+
+```{r}
+#| label: rob-transforms
+model_data <- model_data |>
+  mutate(asinh_net_votes = asinh(net_votes),
+         slog_net_votes  = sign(net_votes) * log1p(abs(net_votes)))
+m3_as <- feols(asinh_net_votes ~ misinformation * emo_z + log_len + is_political |
+                 category + month, data = model_data, vcov = se_main, notes = FALSE)
+m4_as <- feols(asinh_net_votes ~ misinformation * emo_z + log_len + is_political |
+                 category + month + author, data = model_data, vcov = se_main, notes = FALSE)
+m3_sl <- feols(slog_net_votes ~ misinformation * emo_z + log_len + is_political |
+                 category + month, data = model_data, vcov = se_main, notes = FALSE)
+m4_sl <- feols(slog_net_votes ~ misinformation * emo_z + log_len + is_political |
+                 category + month + author, data = model_data, vcov = se_main, notes = FALSE)
+tabRob7 <- modelsummary(
+  list("asinh (3)" = m3_as, "asinh (4)" = m4_as,
+       "signed log (3)" = m3_sl, "signed log (4)" = m4_sl),
+  stars = TRUE, output = "gt",
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z")],
+  gof_map = c("nobs", "r.squared", "r2.within"),
+  title = "Table Rob7. Sign-preserving outcome transformations (net votes)",
+  notes = "asinh(x) and sign(x) * log(1 + |x|) retain the 150 negative net-vote values that the primary outcome floors at zero.")
+if (save_pdf) tryCatch(gt::gtsave(tabRob7, file.path(pdf_dir, "Rob7_transforms.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob7
+```
+
+## 9.8 Author-clustered standard errors (sensitivity)
+
+The documented inference choice is HC1 without clustering, on the grounds that author is absorbed in the key comparison column. Absorbing the author mean does not by itself rule out residual correlation within authors, so the confirmatory family is re-reported with standard errors clustered by author as an appendix sensitivity. Point estimates are identical by construction; only the uncertainty changes.
+
+```{r}
+#| label: rob-cluster
+tabRob8 <- modelsummary(famA("log_net_votes"), stars = TRUE, output = "gt",
+  vcov = ~author,
+  coef_map = cmap[c("misinformation", "emo_z", "misinformation:emo_z", "log_len")],
+  gof_map = c("nobs", "r.squared", "r2.within"),
+  title = "Table Rob8. Table A (net votes) with author-clustered standard errors",
+  notes = "Same models as Table A; standard errors clustered by author (1,716 clusters). Column (4) clusters on the fixed-effect dimension.")
+if (save_pdf) tryCatch(gt::gtsave(tabRob8, file.path(pdf_dir, "Rob8_clustered.pdf")),
+                       error = function(e) message(conditionMessage(e)))
+tabRob8
+```
+
+# 10. Summary of the argument
+
+Three layers, one story. Between all authors, misinformation appears penalized, but the penalty is composition: misinformation posts differ in topic and in who writes them, and the composition placebo, built on standing measured strictly before the window, shows misinformation posts are associated with higher-standing authors in the sample. Between multi-post authors, one asymmetry remains: emotional language is associated with more approval only for broadly accurate content, the penalty for emotional misinformation is specifically an anger penalty, and the asymmetry appears only in the tokenized approval margin, not in diffusion. Within authors, with identification verified in section 5, the estimates are precisely centred near zero. Author identity absorbs most engagement variance, and much of that author effect is observable pre-window standing in the stake-weighted system. The observational evidence therefore does not confirm the cobra effect: engagement on Hive is more strongly associated with accumulated author standing than with the measured post-level content features, and lower accuracy shows no observable engagement advantage at any margin, including payout. These statements are associative throughout: content accuracy is not exogenously assigned in field data, so causal effects of accuracy or emotional language on engagement remain a question for future experimental research.
